@@ -12,6 +12,18 @@
 
 def ciRef() { env.TAG_NAME?.startsWith('v') ? env.TAG_NAME : 'main' }
 
+// Run a network step up to 10 times, 30 s apart: this agent's connection
+// drops for minutes at a time.
+def withNetRetry(Closure body) {
+    def attempt = 0
+    retry(10) {
+        if (attempt++ > 0) {
+            sleep(time: 30, unit: 'SECONDS')
+        }
+        body()
+    }
+}
+
 pipeline {
     agent any
     options {
@@ -19,6 +31,8 @@ pipeline {
         ansiColor('xterm')
         timeout(time: 3, unit: 'HOURS')
         disableConcurrentBuilds()
+        // Checked out in the first stage, with withNetRetry.
+        skipDefaultCheckout()
         buildDiscarder(logRotator(numToKeepStr: '20'))
     }
     environment {
@@ -27,9 +41,12 @@ pipeline {
         DAEMON_DIR = "${env.WORKSPACE}"
     }
     stages {
-        stage('CI scripts') {
+        stage('Sources') {
             steps {
-                retry(3) {
+                withNetRetry {
+                    checkout scm
+                }
+                withNetRetry {
                     sh "rm -rf \"\$KOOL277\" && git clone -q --depth 1 --branch ${ciRef()} https://github.com/kool277/jami.git \"\$KOOL277\""
                 }
             }
@@ -58,7 +75,7 @@ pipeline {
                 withCredentials([usernamePassword(credentialsId: 'github-kool277',
                                                   usernameVariable: 'GH_USER',
                                                   passwordVariable: 'GH_TOKEN')]) {
-                    retry(3) {
+                    withNetRetry {
                         sh '"$CI/release/publish-release.sh" jami-daemon "$TAG_NAME" build/dist/*'
                     }
                 }
