@@ -1,0 +1,68 @@
+// kool277 pipeline for kool277/jami-daemon (multibranch job from
+// ci/jenkins/setup.sh in kool277/jami). The build scripts live in the
+// workspace repository kool277/jami: each build fetches it (outside the
+// checkout, into $WORKSPACE_TMP/kool277) at the same tag for a v* release,
+// else main. Builds reuse build/ and the contrib tree of the previous
+// build in this Jenkins workspace.
+//
+// Every build: configure and build in the ci/daemon container, smoke tests,
+// jamid on D-Bus. On a v* tag: package and publish the GitHub release
+// (see RELEASING.md in kool277/jami). Needs the github-kool277 credential,
+// docker and /var/cache/jami on the agent.
+
+def ciRef() { env.TAG_NAME?.startsWith('v') ? env.TAG_NAME : 'main' }
+
+pipeline {
+    agent any
+    options {
+        timestamps()
+        ansiColor('xterm')
+        timeout(time: 3, unit: 'HOURS')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+    environment {
+        KOOL277 = "${env.WORKSPACE_TMP}/kool277"
+        CI = "${env.WORKSPACE_TMP}/kool277/ci"
+        DAEMON_DIR = "${env.WORKSPACE}"
+    }
+    stages {
+        stage('CI scripts') {
+            steps {
+                retry(3) {
+                    sh "rm -rf \"\$KOOL277\" && git clone -q --depth 1 --branch ${ciRef()} https://github.com/kool277/jami.git \"\$KOOL277\""
+                }
+            }
+        }
+        stage('Build') {
+            steps {
+                sh 'JOBS=$(nproc) "$CI/daemon/run.sh"'
+            }
+        }
+        stage('Test') {
+            steps {
+                sh '''"$CI/daemon/run.sh" ctest --test-dir build --output-on-failure \
+                        -R '^(base64|string_utils|utf8_utils|fileutils)$' \
+                        --output-junit /src/jami-daemon/build/ctest-smoke.xml'''
+                sh '"$CI/daemon/run.sh" dbus-run-session -- sh /ci/dbus-check.sh'
+            }
+            post {
+                always { junit allowEmptyResults: true, testResults: 'build/ctest-smoke.xml' }
+            }
+        }
+        stage('Release') {
+            when { tag 'v*' }
+            steps {
+                sh 'VERSION="$TAG_NAME" DOCKER_RUN_ARGS="-e VERSION" "$CI/daemon/run.sh" sh /ci/package.sh'
+                archiveArtifacts artifacts: 'build/dist/*', fingerprint: true
+                withCredentials([usernamePassword(credentialsId: 'github-kool277',
+                                                  usernameVariable: 'GH_USER',
+                                                  passwordVariable: 'GH_TOKEN')]) {
+                    retry(3) {
+                        sh '"$CI/release/publish-release.sh" jami-daemon "$TAG_NAME" build/dist/*'
+                    }
+                }
+            }
+        }
+    }
+}
