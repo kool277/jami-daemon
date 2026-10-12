@@ -82,4 +82,16 @@ pipeline {
             }
         }
     }
+    post {
+        // A v* tag is built once, for a release: free its workspace,
+        // several GB with the contrib build, when the build ends. Branch
+        // and pull request builds keep theirs to build incrementally.
+        cleanup {
+            script {
+                if (env.TAG_NAME?.startsWith('v')) {
+                    cleanWs(notFailBuild: true)
+                }
+            }
+        }
+    }
 }
