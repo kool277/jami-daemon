@@ -1,16 +1,30 @@
 // kool277 pipeline for kool277/jami-daemon (multibranch job from
 // ci/jenkins/setup.sh in kool277/jami). The build scripts live in the
 // workspace repository kool277/jami: each build fetches it (outside the
-// checkout, into $WORKSPACE_TMP/kool277) at the same tag for a v* release,
-// else main. Builds reuse build/ and the contrib tree of the previous
-// build in this Jenkins workspace.
+// checkout, into $WORKSPACE_TMP/kool277) for a v* release tag at the
+// platform release named in the tag message, else main. Builds reuse build/
+// and the contrib tree of the previous build in this Jenkins workspace.
 //
 // Every build: configure and build in the ci/daemon container, smoke tests,
 // jamid on D-Bus. On a v* tag: package and publish the GitHub release
 // (see RELEASING.md in kool277/jami). Needs the github-kool277 credential,
 // docker and /var/cache/jami on the agent.
 
-def ciRef() { env.TAG_NAME?.startsWith('v') ? env.TAG_NAME : 'main' }
+// The kool277/jami ref to build with: for a v* release tag, the platform
+// release that made it, from the "Platform:" line of the tag message (see
+// ci/release/platform-release.sh in kool277/jami); else main. Call it after
+// the checkout.
+def ciRef() {
+    if (!env.TAG_NAME?.startsWith('v')) {
+        return 'main'
+    }
+    def platform = sh(returnStdout: true,
+                      script: 'git for-each-ref --format="%(contents)" "refs/tags/$TAG_NAME" | sed -n "s/^Platform: //p"').trim()
+    if (!platform) {
+        error("The message of tag ${env.TAG_NAME} names no platform release (no Platform: line)")
+    }
+    return platform
+}
 
 // Run a network step up to 10 times, 30 s apart: this agent's connection
 // drops for minutes at a time.
@@ -46,8 +60,11 @@ pipeline {
                 withNetRetry {
                     checkout scm
                 }
+                script {
+                    env.CI_REF = ciRef()
+                }
                 withNetRetry {
-                    sh "rm -rf \"\$KOOL277\" && git clone -q --depth 1 --branch ${ciRef()} https://github.com/kool277/jami.git \"\$KOOL277\""
+                    sh 'rm -rf "$KOOL277" && git clone -q --depth 1 --branch "$CI_REF" https://github.com/kool277/jami.git "$KOOL277"'
                 }
             }
         }
@@ -76,7 +93,7 @@ pipeline {
                                                   usernameVariable: 'GH_USER',
                                                   passwordVariable: 'GH_TOKEN')]) {
                     withNetRetry {
-                        sh '"$CI/release/publish-release.sh" jami-daemon "$TAG_NAME" build/dist/*'
+                        sh 'PLATFORM="$CI_REF" "$CI/release/publish-release.sh" jami-daemon "$TAG_NAME" build/dist/*'
                     }
                 }
             }
