@@ -1835,11 +1835,14 @@ Conference::getCallWith(const std::string& accountUri, const std::string& device
 std::string
 Conference::getRemoteId(const std::shared_ptr<jami::Call>& call) const
 {
-    if (auto* transport = std::dynamic_pointer_cast<SIPCall>(call)->getTransport())
+    if (auto* transport = std::dynamic_pointer_cast<SIPCall>(call)->getTransport()) {
         if (auto cert = transport->getTlsInfos().peerCert)
             if (cert->issuer)
                 return cert->issuer->getId().toString();
-    return {};
+        return {};
+    }
+    // A call without SIP, such as a web client's: the peer's account.
+    return call->getPeerNumber();
 }
 
 void
@@ -2038,6 +2041,9 @@ Conference::bindSubCallAudio(const std::string& callId)
         auto otherCall = getCall(otherId);
         if (!otherCall)
             continue;
+        // Members of a mesh hear each other directly.
+        if (participantCall->isMeshLeg() and otherCall->isMeshLeg())
+            continue;
 
         const bool otherMuted = isMuted(otherId);
         const auto otherStreams = otherCall->getRemoteAudioStreams();
@@ -2170,13 +2176,9 @@ Conference::clearParticipantData(const std::string& callId)
         return;
     }
 
+    // A call without SIP, such as a web client's, has no device.
     auto* transport = call->getTransport();
-    if (!transport) {
-        JAMI_WARNING("[conf:{}] Unable to find transport for call {} to clear participant", id_, callId);
-        return;
-    }
-
-    const std::string deviceId = std::string(transport->deviceId());
+    const std::string deviceId = transport ? std::string(transport->deviceId()) : std::string {};
     const std::string participantId = getRemoteId(call);
 
     {

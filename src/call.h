@@ -328,6 +328,11 @@ public:
      */
     void addSubCall(Call& call);
 
+    // A leg of a mesh, such as a web client's group call: its peer gets each
+    // other member's media directly, so a conference sends it only this
+    // device's own.
+    virtual bool isMeshLeg() const { return false; }
+
     ///
     /// Return true if this call instance is a subcall (internal call for multi-device handling)
     ///
@@ -440,6 +445,8 @@ protected:
     using clock = std::chrono::steady_clock;
     using time_point = clock::time_point;
     virtual void merge(Call& scall);
+    // Hangs up the calls to the peer's devices that have not answered.
+    void hangupSubcalls(int code = 0);
 
     /**
      * Constructor of a call

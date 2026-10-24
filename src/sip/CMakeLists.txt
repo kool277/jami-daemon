@@ -10,6 +10,8 @@ list (APPEND Source_Files__sip
       "${CMAKE_CURRENT_SOURCE_DIR}/sdes_negotiator.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/sdp.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/sdp.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/webrtccall.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/webrtccall.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/webrtc_sdp.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/webrtc_sdp.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/sipaccount.cpp"

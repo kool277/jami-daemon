@@ -24,6 +24,8 @@
 #include "jamidht/account_manager.h"
 #include "jamidht/commit_message.h"
 #include "jamidht/jamiaccount.h"
+#include "jamidht/web_call_signaling.h"
+#include "media_const.h"
 #include "jamidht/collaborative_editing.h"
 #include "jamidht/presence_manager.h"
 #include "manager.h"
@@ -3953,6 +3955,14 @@ ConversationModule::hostConference(const std::string& conversationId,
 
     if (createConf) {
         emitSignal<libjami::CallSignal::ConferenceCreated>(acc->getAccountID(), conversationId, conf->getConfId());
+        // The members who use the web client join it from their browsers.
+        bool withVideo = std::any_of(mediaList.begin(), mediaList.end(), [](const libjami::MediaMap& media) {
+            auto type = media.find(libjami::Media::MediaAttributeKey::MEDIA_TYPE);
+            auto enabled = media.find(libjami::Media::MediaAttributeKey::ENABLED);
+            return type != media.end() and type->second == libjami::Media::Details::MEDIA_TYPE_VIDEO
+                   and (enabled == media.end() or enabled->second == "true");
+        });
+        acc->webCallSignaling().onHosting(conversationId, conf->getConfId(), withVideo);
     } else {
         conf->reportMediaNegotiationStatus();
         emitSignal<libjami::CallSignal::ConferenceChanged>(acc->getAccountID(), conf->getConfId(), conf->getStateStr());
@@ -3983,10 +3993,13 @@ ConversationModule::hostConference(const std::string& conversationId,
     // Master call, so when it's stopped, the conference will be stopped (as we use the hold
     // state for detaching the call)
     conf->onShutdown([w = pimpl_->weak(),
+                      account = pimpl_->account_,
                       accountUri = pimpl_->username_,
                       confId = conf->getConfId(),
                       conversationId,
                       conv](int duration) {
+        if (auto acc = account.lock())
+            acc->webCallSignaling().onHostingEnded(conversationId, confId);
         auto shared = w.lock();
         if (shared) {
             auto message = CommitMessage::conferenceHostingEnd(confId, shared->deviceId_, accountUri, duration);

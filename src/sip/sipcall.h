@@ -111,7 +111,7 @@ public:
     LinkType getLinkType() const override { return LINK_TYPE; }
 
     // Override of Call class
-private:
+protected:
     void merge(Call& call) override; // not public - only called by Call
 
 public:
@@ -253,9 +253,9 @@ public:
     // Move the dialog to the channel on which the peer sent an in-dialog request.
     void followPeerTransport(const std::shared_ptr<SipTransport>& transport, const std::string& contact, bool probe);
 
-    void sendSIPInfo(std::string_view body, std::string_view subtype);
+    virtual void sendSIPInfo(std::string_view body, std::string_view subtype);
 
-    void requestKeyframe(int streamIdx = -1);
+    virtual void requestKeyframe(int streamIdx = -1);
 
     void updateRecState(bool state) override;
 
@@ -332,6 +332,19 @@ public:
     void reportMediaNegotiationStatus();
 
     const std::vector<RtpStream>& getRtpStreams() const { return rtpStreams_; }
+
+protected:
+    // For calls that negotiate their media without SIP, such as WebRtcCall.
+    void stopAllMedia();
+    // Drops the ICE transports of SIP media, which such a call does not use.
+    void stopIceMedia();
+    // Configure the RTP session from SDP description.
+    void configureRtpSession(const std::shared_ptr<RtpSession>& rtpSession,
+                             const std::shared_ptr<MediaAttribute>& mediaAttr,
+                             const MediaDescription& localMedia,
+                             const MediaDescription& remoteMedia);
+    // Find the stream index with the matching label
+    int findRtpStreamIndex(const std::string& label) const;
 
 private:
     void stopCallRecovery();
@@ -413,7 +426,6 @@ private:
     void onIceNegoSucceed();
     void setupNegotiatedMedia();
     void startAllMedia();
-    void stopAllMedia();
 
     /**
      * Transfer method used for both type of transfer
@@ -444,14 +456,6 @@ private:
     size_t initMediaStreams(const std::vector<MediaAttribute>& mediaAttrList);
     // Create a new stream from SDP description.
     void createRtpSession(RtpStream& rtpStream);
-    // Configure the RTP session from SDP description.
-    void configureRtpSession(const std::shared_ptr<RtpSession>& rtpSession,
-                             const std::shared_ptr<MediaAttribute>& mediaAttr,
-                             const MediaDescription& localMedia,
-                             const MediaDescription& remoteMedia);
-    // Find the stream index with the matching label
-    int findRtpStreamIndex(const std::string& label) const;
-
     std::vector<IceCandidate> getAllRemoteCandidates(dhtnet::IceTransport& transport) const;
 
     inline std::shared_ptr<const SIPCall> shared() const
@@ -489,8 +493,11 @@ private:
     // Peer's allowed methods.
     std::vector<std::string> peerAllowedMethods_;
 
+protected:
     // Vector holding the current RTP sessions.
     std::vector<RtpStream> rtpStreams_;
+
+private:
 
     /**
      * Hold the transport used for SIP communication.

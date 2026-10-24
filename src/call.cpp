@@ -231,6 +231,15 @@ Call::setState(CallState call_state, ConnectionState cnx_state, signed code)
              (unsigned) cnx_state,
              code);
 
+    // An answered call does not ring again: a late step of its setup, such as
+    // the search for the peer's devices, does not undo the answer.
+    if (connectionState_ == ConnectionState::CONNECTED
+        and (cnx_state == ConnectionState::TRYING or cnx_state == ConnectionState::PROGRESSING
+             or cnx_state == ConnectionState::RINGING)) {
+        JAMI_WARNING("[call:{}] Ignoring connection state {} after the answer", id_, (unsigned) cnx_state);
+        return false;
+    }
+
     if (callState_ != call_state) {
         if (not validStateTransition(call_state)) {
             JAMI_ERROR("[call:{}] invalid call state transition from {} to {}",
@@ -592,6 +601,12 @@ Call::safePopSubcalls()
     auto old_value = std::move(subcalls_);
     subcalls_.clear();
     return old_value;
+}
+
+void
+Call::hangupSubcalls(int code)
+{
+    hangupCalls(safePopSubcalls(), code);
 }
 
 void

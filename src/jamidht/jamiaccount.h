@@ -85,6 +85,7 @@ namespace test {
 class Account_factoryTest;
 }
 class CollaborativeEditing;
+class WebCallSignaling;
 
 using SipConnectionKey = std::pair<std::string /* uri */, DeviceId>;
 
@@ -496,6 +497,8 @@ public:
      * @return conversationModule instance
      */
     ConversationModule* convModule(bool noCreation = false);
+    // Calls with users of the web client (see WebCallSignaling).
+    WebCallSignaling& webCallSignaling();
     SyncModule* syncModule();
 
     /**
@@ -1031,6 +1034,8 @@ private:
     std::mutex moduleMtx_;
     std::unique_ptr<SyncModule> syncModule_;
     std::shared_ptr<CollaborativeEditing> collaborativeEditing_;
+    std::once_flag webCallSignalingOnce_;
+    std::unique_ptr<WebCallSignaling> webCallSignaling_;
 
     std::mutex rdvMtx_;
 

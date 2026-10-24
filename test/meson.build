@@ -131,6 +131,21 @@ test(
     timeout: 1800,
 )
 
+ut_web_call_signaling = executable(
+    'ut_web_call_signaling',
+    sources: files('unitTest/call/test_web_call_signaling.cpp'),
+    include_directories: ut_includedirs,
+    dependencies: ut_dependencies,
+    link_with: ut_library,
+)
+test(
+    'web_call_signaling',
+    ut_web_call_signaling,
+    workdir: ut_workdir,
+    is_parallel: false,
+    timeout: 1800,
+)
+
 ut_webrtc_sdp = executable(
     'ut_webrtc_sdp',
     sources: files('unitTest/sip/test_webrtc_sdp.cpp'),

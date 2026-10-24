@@ -19,12 +19,14 @@
 #include "jamidht/jamiaccount.h"
 #include "sip/sipcall.h"
 #include "sip/siptransport.h"
+#include "sip/webrtccall.h"
 #include "../../test_runner.h"
 #include "jami.h"
 #include "account_const.h"
 #include "account_schema.h"
 #include "media_const.h"
 #include "call_const.h"
+#include "conversation_interface.h"
 #include "common.h"
 
 #include <dhtnet/connectionmanager.h>
@@ -36,6 +38,7 @@
 #include <condition_variable>
 #include <filesystem>
 #include <string>
+#include <thread>
 
 using namespace libjami::Account;
 using namespace libjami::Call::Details;
@@ -65,6 +68,7 @@ public:
 
 private:
     void testCall();
+    void testCallBetweenContacts();
     void testCachedCall();
     void testStopSearching();
     void testDeclineMultiDevice();
@@ -76,6 +80,7 @@ private:
 
     CPPUNIT_TEST_SUITE(CallTest);
     CPPUNIT_TEST(testCall);
+    CPPUNIT_TEST(testCallBetweenContacts);
     CPPUNIT_TEST(testCachedCall);
     CPPUNIT_TEST(testStopSearching);
     CPPUNIT_TEST(testDeclineMultiDevice);
@@ -153,6 +158,100 @@ CallTest::testCall()
     callStopped = 0;
     Manager::instance().hangupCall(aliceId, call);
     CPPUNIT_ASSERT(cv.wait_for(lk, 30s, [&] { return callStopped == 2; }));
+}
+
+void
+CallTest::testCallBetweenContacts()
+{
+    // In a one-to-one conversation, a call also rings the peer's browsers
+    // (see WebRtcCall). The peer's devices leave that invite to them and
+    // ring with the SIP call, which goes on as any call once one answers.
+    add_confirmed_contact(aliceId, bobId);
+    auto aliceAccount = Manager::instance().getAccount<JamiAccount>(aliceId);
+    auto bobUri = Manager::instance().getAccount<JamiAccount>(bobId)->getUsername();
+    // Alice's side of the conversation knows bob joined it.
+    auto isMember = [&] {
+        auto conversationId = aliceAccount->convModule()->getOneToOneConversation(bobUri);
+        if (conversationId.empty())
+            return false;
+        for (const auto& member : libjami::getConversationMembers(aliceId, conversationId)) {
+            auto uri = member.find("uri");
+            auto role = member.find("role");
+            if (uri != member.end() and uri->second == bobUri and role != member.end() and role->second == "member")
+                return true;
+        }
+        return false;
+    };
+    for (int i = 0; i < 60 and not isMember(); ++i)
+        std::this_thread::sleep_for(500ms);
+    CPPUNIT_ASSERT(isMember());
+
+    std::mutex mtx;
+    std::unique_lock lk {mtx};
+    std::condition_variable cv;
+    std::mutex stateMtx;
+    std::vector<std::string> bobCalls;
+    std::map<std::string, std::string> states;
+    auto stateOf = [&](const std::string& callId) {
+        std::lock_guard l {stateMtx};
+        auto it = states.find(callId);
+        return it == states.end() ? std::string() : it->second;
+    };
+    std::map<std::string, std::shared_ptr<libjami::CallbackWrapperBase>> confHandlers;
+    confHandlers.insert(libjami::exportable_callback<libjami::CallSignal::IncomingCall>(
+        [&](const std::string& accountId,
+            const std::string& callId,
+            const std::string&,
+            const std::vector<std::map<std::string, std::string>>&) {
+            if (accountId != bobId)
+                return;
+            {
+                std::lock_guard l {stateMtx};
+                bobCalls.emplace_back(callId);
+            }
+            cv.notify_one();
+        }));
+    confHandlers.insert(libjami::exportable_callback<libjami::CallSignal::StateChange>(
+        [&](const std::string&, const std::string& callId, const std::string& state, signed) {
+            {
+                std::lock_guard l {stateMtx};
+                states[callId] = state;
+            }
+            cv.notify_one();
+        }));
+    libjami::registerSignalHandlers(confHandlers);
+    auto bobCallCount = [&] {
+        std::lock_guard l {stateMtx};
+        return bobCalls.size();
+    };
+
+    auto aliceCall = libjami::placeCallWithMedia(aliceId, "jami:" + bobUri, {});
+    CPPUNIT_ASSERT(std::dynamic_pointer_cast<WebRtcCall>(Manager::instance().getCallFromCallID(aliceCall)));
+    CPPUNIT_ASSERT(cv.wait_for(lk, 30s, [&] { return bobCallCount() > 0; }));
+    std::string bobCall;
+    {
+        std::lock_guard l {stateMtx};
+        bobCall = bobCalls.front();
+    }
+    CPPUNIT_ASSERT(std::dynamic_pointer_cast<SIPCall>(Manager::instance().getCallFromCallID(bobCall)));
+    CPPUNIT_ASSERT(not std::dynamic_pointer_cast<WebRtcCall>(Manager::instance().getCallFromCallID(bobCall)));
+
+    lk.unlock();
+    libjami::acceptWithMedia(bobId, bobCall, {});
+    lk.lock();
+    CPPUNIT_ASSERT(cv.wait_for(lk, 30s, [&] { return stateOf(aliceCall) == "CURRENT" and stateOf(bobCall) == "CURRENT"; }));
+    // The invite to the browsers went before the SIP call: by now bob's device
+    // has it, and rang only with the SIP call.
+    CPPUNIT_ASSERT_EQUAL(size_t(1), bobCallCount());
+    for (const auto& id : Manager::instance().getCallList()) {
+        auto call = Manager::instance().getCallFromCallID(id);
+        CPPUNIT_ASSERT(not call or call->getAccountId() != bobId or not std::dynamic_pointer_cast<WebRtcCall>(call));
+    }
+
+    lk.unlock();
+    Manager::instance().hangupCall(aliceId, aliceCall);
+    lk.lock();
+    CPPUNIT_ASSERT(cv.wait_for(lk, 30s, [&] { return stateOf(aliceCall) == "OVER" and stateOf(bobCall) == "OVER"; }));
 }
 
 void

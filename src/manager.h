@@ -122,6 +122,11 @@ public:
      */
     void init(const std::filesystem::path& config_file, libjami::InitFlag flags);
 
+    // Whether calls with the web client's users are taken here: not when the
+    // app handles their messages (LIBJAMI_FLAG_NO_WEB_CALLS, as the web
+    // client's server), nor without local audio and video.
+    bool takesWebCalls() const;
+
     /*
      * Terminate all threads and exit DBus loop
      */
