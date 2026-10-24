@@ -18,6 +18,7 @@
 
 #include "jamidht/jamiaccount.h"
 #include "client/jami_signal.h"
+#include "jami/call_const.h"
 #include "logger.h"
 #include "manager.h"
 #include "media/audio/audio_rtp_session.h"
@@ -160,6 +161,10 @@ WebRtcCall::WebRtcCall(const std::shared_ptr<SIPAccountBase>& account,
              peerUri_,
              conversationId_,
              group_ ? " (group)" : "");
+    // As a SIP call's, from its To header: the apps attach an incoming call
+    // to its conversation only when it names their account.
+    if (type == Call::CallType::INCOMING)
+        toUsername(account->getUsername());
 #ifdef ENABLE_VIDEO
     // Each member gets the others' video directly, not this device's mix.
     if (group_ and group_->isMesh()) {
@@ -172,6 +177,18 @@ WebRtcCall::WebRtcCall(const std::shared_ptr<SIPAccountBase>& account,
 WebRtcCall::~WebRtcCall()
 {
     stopTransports();
+}
+
+std::map<std::string, std::string>
+WebRtcCall::getDetails() const
+{
+    auto details = SIPCall::getDetails();
+    // An incoming call names its peer as a SIP call's From header does. The
+    // apps take a bare URI for a SIP peer, without a name of its own:
+    // jami-client-qt named the caller's contact after the URI, and saved it.
+    if (getCallType() == Call::CallType::INCOMING and not getPeerNumber().empty())
+        details[libjami::Call::Details::PEER_NUMBER] = getPeerNumber() + "@ring.dht";
+    return details;
 }
 
 std::shared_ptr<WebRtcCall>
