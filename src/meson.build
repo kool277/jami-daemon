@@ -90,6 +90,7 @@ libjami_sources = files(
     'sip/pres_sub_server.cpp',
     'sip/sdes_negotiator.cpp',
     'sip/sdp.cpp',
+    'sip/webrtc_sdp.cpp',
     'sip/sipaccount.cpp',
     'sip/sipaccount_config.cpp',
     'sip/sipaccountbase.cpp',

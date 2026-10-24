@@ -1104,6 +1104,7 @@ else()
         add_test_executable(srtp test/unitTest/media/test_srtp.cpp)
         add_test_executable(socket_pair_mux test/unitTest/media/test_socket_pair_mux.cpp)
         add_test_executable(dtls_srtp_transport test/unitTest/media/test_dtls_srtp_transport.cpp)
+        add_test_executable(webrtc_sdp test/unitTest/sip/test_webrtc_sdp.cpp)
         add_test_executable(linkdevice test/unitTest/linkdevice/linkdevice.cpp)
 
         if (JAMI_VIDEO)

@@ -131,6 +131,21 @@ test(
     timeout: 1800,
 )
 
+ut_webrtc_sdp = executable(
+    'ut_webrtc_sdp',
+    sources: files('unitTest/sip/test_webrtc_sdp.cpp'),
+    include_directories: ut_includedirs,
+    dependencies: ut_dependencies,
+    link_with: ut_library,
+)
+test(
+    'webrtc_sdp',
+    ut_webrtc_sdp,
+    workdir: ut_workdir,
+    is_parallel: false,
+    timeout: 1800,
+)
+
 ut_sdes_negotiator = executable(
     'ut_sdes_negotiator',
     sources: files('unitTest/sip/sdes_negotiator.cpp'),
