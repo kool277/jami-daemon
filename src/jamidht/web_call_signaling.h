@@ -117,6 +117,8 @@ private:
                  std::string peerSession,
                  std::string peerDevice);
     void retire(const std::string& conversationId, std::string&& session);
+    // retire, for a group call: its member's session is over.
+    void retireSession(const std::string& conversationId, std::string session);
     bool isMember(const std::string& conversationId, const std::string& uri, size_t* memberCount = nullptr);
     // To the peer of the conversation's call, on the device of its session.
     void sendToCall(const std::string& to, const std::string& conversationId, const std::string& type, Json::Value&& data);

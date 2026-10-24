@@ -53,6 +53,8 @@ public:
     virtual void onLocalJoin(WebRtcCall& leg) = 0;
     // A leg ended, as its member left (byPeer) or as this device hung up.
     virtual void onLegEnded(WebRtcCall& leg, bool byPeer) = 0;
+    // The user resumed a leg that was on hold.
+    virtual void onLegResumed(WebRtcCall&) {}
 };
 
 // A call with a user of the web client, whose browser speaks WebRTC. The call

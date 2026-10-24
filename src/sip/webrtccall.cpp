@@ -1322,6 +1322,9 @@ WebRtcCall::resume(OnReadyCb&& cb)
     }
     if (cb)
         cb(resumed);
+    // Members who connected while it was on hold join the call now.
+    if (resumed and group_)
+        group_->onLegResumed(*this);
     return resumed;
 }
 

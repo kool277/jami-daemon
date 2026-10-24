@@ -26,11 +26,13 @@
 #include "media/media_attribute.h"
 #include "sip/webrtccall.h"
 
+#include <asio/steady_timer.hpp>
 #include <opendht/thread_pool.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <optional>
 
 namespace jami {
 
@@ -48,6 +50,10 @@ constexpr auto MAX_INVITE_AGE = std::chrono::minutes(2);
 // Members a group call connects this device to: a mesh sends each one this
 // device's media, so it does not grow far.
 constexpr size_t MAX_GROUP_LEGS = 8;
+// A member's new session (a reload) gets a new leg; sessions that follow one
+// another faster wait for this long, so that each makes no new leg (ICE and
+// DTLS setup, a conference change) more often than this.
+constexpr auto RECONNECT_PAUSE = std::chrono::seconds(3);
 constexpr size_t MAX_SESSION_ID_SIZE = 64;
 constexpr std::string_view MIME_TYPE = "application/json";
 
@@ -150,9 +156,23 @@ public:
     // The first invite: this device rings, with a leg to the member who invited.
     void ring(const std::string& from, const Message& message, bool withVideo)
     {
+        {
+            std::lock_guard lk(mutex_);
+            withVideo_ = withVideo;
+        }
+        ring(from, message.sessionId, message.device);
+    }
+
+    void ring(const std::string& from, const std::string& session, const std::string& device)
+    {
         auto account = account_.lock();
         if (not account)
             return;
+        bool withVideo;
+        {
+            std::lock_guard lk(mutex_);
+            withVideo = withVideo_;
+        }
         auto media = MediaAttribute::mediaAttributesToMediaMaps(account->createDefaultMediaList(withVideo));
         auto leg = newLeg(Call::CallType::INCOMING, from, media);
         if (not leg) {
@@ -161,7 +181,10 @@ public:
         }
         {
             std::lock_guard lk(mutex_);
-            members_[from] = {message.sessionId, message.device, leg};
+            auto& member = members_[from];
+            member.session = session;
+            member.device = device;
+            member.leg = leg;
             ringing_ = leg;
         }
         leg->setState(Call::ConnectionState::PROGRESSING);
@@ -184,6 +207,12 @@ public:
             if (leg and not leg->hasEnded() and member.session == message.sessionId)
                 return;
             if (state_ == State::Ringing) {
+                // The member this device rings for keeps the session of its
+                // invite: a join of another session comes late from an
+                // earlier call, or from another tab, which connects once this
+                // device joined.
+                if (leg and leg == ringing_.lock())
+                    return;
                 // It connects to this device once this one joins.
                 member.session = message.sessionId;
                 member.device = message.device;
@@ -220,7 +249,11 @@ public:
 
     void onExit(const std::string& from, const Message& message)
     {
+        // A message of this session that comes later is late.
+        if (auto account = account_.lock())
+            account->webCallSignaling().retireSession(conversationId_, message.sessionId);
         std::shared_ptr<WebRtcCall> leg;
+        std::string next, nextSession, nextDevice;
         {
             std::lock_guard lk(mutex_);
             auto it = members_.find(from);
@@ -233,10 +266,32 @@ public:
             leg = it->second.leg.lock();
             members_.erase(it);
             if (state_ == State::Ringing) {
-                // It rings while anyone is in the call.
-                leg = members_.empty() ? ringing_.lock() : nullptr;
+                auto ringing = ringing_.lock();
+                if (members_.empty()) {
+                    // Nobody is in the call any more.
+                    leg = ringing;
+                } else if (ringing and ringing == leg) {
+                    // The member this device rings for left, others are in
+                    // the call: it rings for one of them instead, so that
+                    // answering connects to someone.
+                    for (const auto& member : members_) {
+                        if (not member.second.session.empty()) {
+                            next = member.first;
+                            nextSession = member.second.session;
+                            nextDevice = member.second.device;
+                            break;
+                        }
+                    }
+                    if (next.empty())
+                        leg = ringing;
+                } else {
+                    leg = nullptr;
+                }
             }
         }
+        // The new call rings first: the old one ending does not end the group.
+        if (not next.empty())
+            ring(next, nextSession, nextDevice);
         if (leg)
             leg->onPeerExit();
     }
@@ -321,6 +376,25 @@ public:
             end(tell);
     }
 
+    void onLegResumed(WebRtcCall& leg) override
+    {
+        // Members who connected while the call was on hold wait on hold
+        // outside the conference (see attach): they join it now.
+        std::vector<std::shared_ptr<WebRtcCall>> waiting;
+        {
+            std::lock_guard lk(mutex_);
+            if (state_ != State::Joined or not hostedConfId_.empty())
+                return;
+            for (const auto& member : members_) {
+                auto other = member.second.leg.lock();
+                if (other and other.get() != &leg and not other->hasEnded() and not other->getConference())
+                    waiting.emplace_back(std::move(other));
+            }
+        }
+        for (const auto& other : waiting)
+            attach(other);
+    }
+
 private:
     enum class State { Ringing, Joined, Ended };
     struct Member
@@ -328,6 +402,12 @@ private:
         std::string session;
         std::string device;
         std::weak_ptr<WebRtcCall> leg;
+        // When this device last made a leg with the member.
+        std::chrono::steady_clock::time_point since {};
+        // A newer session that came within RECONNECT_PAUSE of that leg: it
+        // gets one when the pause is over (the latest such session only).
+        std::optional<Message> pending {};
+        bool pendingOffering {false};
     };
 
     std::shared_ptr<WebRtcCall> newLeg(Call::CallType type,
@@ -369,10 +449,28 @@ private:
             std::lock_guard lk(mutex_);
             if (state_ != State::Joined)
                 return {};
-            auto legs = std::count_if(members_.begin(), members_.end(), [](const auto& member) {
-                auto leg = member.second.leg.lock();
-                return leg and not leg->hasEnded();
-            });
+            auto now = std::chrono::steady_clock::now();
+            auto& member = members_[peer];
+            if (member.since != std::chrono::steady_clock::time_point {} and now - member.since < RECONNECT_PAUSE) {
+                bool scheduled = member.pending.has_value();
+                member.pending = message;
+                member.pendingOffering = offering;
+                if (not scheduled)
+                    connectLater(peer, member.since + RECONNECT_PAUSE);
+                return {};
+            }
+            // Legs being torn down still hold their transports.
+            ending_.erase(std::remove_if(ending_.begin(),
+                                         ending_.end(),
+                                         [](const auto& w) {
+                                             auto leg = w.lock();
+                                             return not leg or leg->hasEnded();
+                                         }),
+                          ending_.end());
+            auto legs = ending_.size() + std::count_if(members_.begin(), members_.end(), [](const auto& member) {
+                            auto leg = member.second.leg.lock();
+                            return leg and not leg->hasEnded();
+                        });
             if (static_cast<size_t>(legs) >= MAX_GROUP_LEGS) {
                 JAMI_WARNING("[Account {}] Group call in {} already connects {} members: not {}",
                              accountId_,
@@ -382,28 +480,145 @@ private:
                 return {};
             }
             media = media_;
+            member.since = now;
         }
         auto leg = newLeg(offering ? Call::CallType::OUTGOING : Call::CallType::INCOMING, peer, media);
         if (not leg)
             return {};
         std::shared_ptr<WebRtcCall> previous;
+        std::string previousSession;
+        bool stored = false;
         {
             std::lock_guard lk(mutex_);
-            auto& member = members_[peer];
-            previous = member.leg.lock();
-            member = {message.sessionId, message.device, leg};
+            // This device may have left the call meanwhile.
+            if (state_ == State::Joined) {
+                auto& member = members_[peer];
+                previous = member.leg.lock();
+                if (member.session != message.sessionId)
+                    previousSession = member.session;
+                member.session = message.sessionId;
+                member.device = message.device;
+                member.leg = leg;
+                if (previous and not previous->hasEnded())
+                    ending_.emplace_back(previous);
+                stored = true;
+            }
         }
-        // An earlier session of the member, which came back (a reload).
+        if (not stored) {
+            leg->hangup(0);
+            return {};
+        }
+        // An earlier session of the member, which came back (a reload): its
+        // late messages must not make a leg again.
+        if (auto account = account_.lock())
+            account->webCallSignaling().retireSession(conversationId_, previousSession);
         if (previous)
             previous->onPeerExit();
         leg->setState(Call::CallState::ACTIVE, Call::ConnectionState::CONNECTED);
+        prepare(leg);
         attach(leg);
         if (offering)
             leg->offer();
         return leg;
     }
 
-    // Into the conference of the call's legs, made with the second one.
+    // The leg the user's call with the group is (the one answered first, then
+    // any other connected leg), for a new leg to join; with others, the other
+    // connected legs. Called with mutex_ held.
+    std::shared_ptr<WebRtcCall> partnerFor(const std::shared_ptr<WebRtcCall>& leg,
+                                           std::vector<std::shared_ptr<WebRtcCall>>* others = nullptr)
+    {
+        auto connected = [&](const std::shared_ptr<WebRtcCall>& call) {
+            return call and call != leg and not call->hasEnded()
+                   and call->getConnectionState() == Call::ConnectionState::CONNECTED;
+        };
+        std::shared_ptr<WebRtcCall> partner;
+        if (auto ringing = ringing_.lock(); connected(ringing))
+            partner = std::move(ringing);
+        for (const auto& member : members_) {
+            auto candidate = member.second.leg.lock();
+            if (not connected(candidate) or candidate == partner)
+                continue;
+            if (not partner)
+                partner = std::move(candidate);
+            else if (others)
+                others->emplace_back(std::move(candidate));
+        }
+        return partner;
+    }
+
+    // Whether the user's call with the group is on hold or is not the user's
+    // current call: a member joining then waits on hold (see attach).
+    static bool isOnHold(const std::shared_ptr<WebRtcCall>& partner)
+    {
+        return partner->getState() != Call::CallState::ACTIVE or not Manager::instance().isCurrentCall(*partner);
+    }
+
+    // A new leg sends, from its first packet, what attach gives it on the main
+    // thread: nothing while the call is on hold, and the camera as the host
+    // of the conference has it.
+    void prepare(const std::shared_ptr<WebRtcCall>& leg)
+    {
+        std::string confId;
+        std::shared_ptr<WebRtcCall> partner;
+        {
+            std::lock_guard lk(mutex_);
+            if (not hostedConfId_.empty())
+                return;
+            confId = confId_;
+            partner = partnerFor(leg);
+        }
+        auto account = account_.lock();
+        auto conference = account and not confId.empty() ? account->getConference(confId) : nullptr;
+        if (conference) {
+#ifdef ENABLE_VIDEO
+            bool detached = conference->getState() != Conference::State::ACTIVE_ATTACHED;
+            leg->applyHostMedia(not detached and conference->isMediaSourceMuted(MediaType::MEDIA_AUDIO),
+                                not detached and conference->isMediaSourceMuted(MediaType::MEDIA_VIDEO),
+                                detached,
+                                conference->getVideoInput());
+#endif
+        } else if (partner and isOnHold(partner)) {
+            leg->hold({});
+        }
+    }
+
+    void connectLater(const std::string& peer, std::chrono::steady_clock::time_point when)
+    {
+        auto timer = std::make_shared<asio::steady_timer>(*Manager::instance().ioContext(), when);
+        timer->async_wait([timer, g = weak_from_this(), peer](const std::error_code& ec) {
+            if (ec)
+                return;
+            if (auto group = g.lock())
+                group->connectPending(peer);
+        });
+    }
+
+    void connectPending(const std::string& peer)
+    {
+        std::optional<Message> message;
+        bool offering;
+        {
+            std::lock_guard lk(mutex_);
+            auto it = members_.find(peer);
+            if (it == members_.end() or not it->second.pending)
+                return;
+            message = std::move(it->second.pending);
+            it->second.pending.reset();
+            offering = it->second.pendingOffering;
+        }
+        auto leg = connect(peer, *message, offering);
+        if (leg and not offering) {
+            const auto& sdp = message->data["sdp"];
+            leg->onRemoteDescription(sdp["type"].asString(), sdp["sdp"].asString());
+        }
+    }
+
+    // Into the conference of the call's legs. Without one, the leg and the
+    // call the user answered (or another leg) make it; while that call is on
+    // hold or another call is the user's, the leg waits on hold until the
+    // user resumes (onLegResumed): a member joining never takes the user back
+    // into the call.
     void attach(const std::shared_ptr<WebRtcCall>& leg)
     {
         runOnMainThread([g = weak_from_this(), w = std::weak_ptr<WebRtcCall>(leg)] {
@@ -413,25 +628,19 @@ private:
             if (not group or not leg or not account or leg->hasEnded())
                 return;
             std::string confId;
-            std::string other;
+            std::shared_ptr<WebRtcCall> partner;
+            std::vector<std::shared_ptr<WebRtcCall>> others;
             {
                 std::lock_guard lk(group->mutex_);
                 confId = group->confId_;
                 // A conference down to one leg was dissolved.
                 if (not confId.empty() and not account->getConference(confId))
                     confId.clear();
-                for (const auto& member : group->members_) {
-                    if (not confId.empty())
-                        break;
-                    auto candidate = member.second.leg.lock();
-                    if (candidate and candidate != leg and not candidate->hasEnded()
-                        and candidate->getConnectionState() == Call::ConnectionState::CONNECTED) {
-                        other = candidate->getCallId();
-                        break;
-                    }
-                }
+                if (confId.empty())
+                    partner = group->partnerFor(leg, &others);
             }
             if (not confId.empty()) {
+                // On hold, the conference takes the leg without the host.
                 Manager::instance().addSubCall(group->accountId_, leg->getCallId(), group->accountId_, confId);
                 return;
             }
@@ -441,12 +650,28 @@ private:
                 return;
             }
             // The only leg: a call with one member, until another connects.
-            if (other.empty())
+            if (not partner)
                 return;
-            if (Manager::instance().joinParticipant(group->accountId_, other, group->accountId_, leg->getCallId())) {
+            if (isOnHold(partner)) {
+                if (leg->getState() == Call::CallState::ACTIVE)
+                    leg->hold({});
+                return;
+            }
+            if (Manager::instance().joinParticipant(group->accountId_,
+                                                    partner->getCallId(),
+                                                    group->accountId_,
+                                                    leg->getCallId())) {
                 if (auto conference = leg->getConference()) {
-                    std::lock_guard lk(group->mutex_);
-                    group->confId_ = conference->getConfId();
+                    {
+                        std::lock_guard lk(group->mutex_);
+                        group->confId_ = conference->getConfId();
+                    }
+                    // Members connected meanwhile, whose attach found no
+                    // conference yet or comes after this one.
+                    for (const auto& other : others) {
+                        if (not other->hasEnded() and not other->getConference())
+                            Manager::instance().addSubCall(*other, *conference);
+                    }
                 }
             }
         });
@@ -479,7 +704,10 @@ private:
     State state_ {State::Ringing};
     // The members in the call, and this device's leg with each.
     std::map<std::string, Member> members_;
+    // Legs of earlier sessions of members, being torn down.
+    std::vector<std::weak_ptr<WebRtcCall>> ending_;
     std::weak_ptr<WebRtcCall> ringing_;
+    bool withVideo_ {false};
     std::vector<libjami::MediaMap> media_;
     std::string confId_;
 };
@@ -774,6 +1002,14 @@ WebCallSignaling::handleGroup(const std::string& from, Message&& message)
     std::shared_ptr<Group> group;
     {
         std::lock_guard lk(mutex_);
+        // A late message of a session that left the call, or that a newer one
+        // replaced: it comes after its exit (a server restarted and sent its
+        // queue again, say).
+        if (not message.sessionId.empty()) {
+            const auto& retired = retired_[message.conversationId];
+            if (std::find(retired.begin(), retired.end(), message.sessionId) != retired.end())
+                return;
+        }
         if (auto it = groups_.find(message.conversationId); it != groups_.end())
             group = it->second;
     }
@@ -900,6 +1136,13 @@ WebCallSignaling::setCall(const std::string& conversationId,
     auto& entry = calls_[conversationId];
     retire(conversationId, std::move(entry.peerSession));
     entry = {call, std::move(peerSession), std::move(peerDevice)};
+}
+
+void
+WebCallSignaling::retireSession(const std::string& conversationId, std::string session)
+{
+    std::lock_guard lk(mutex_);
+    retire(conversationId, std::move(session));
 }
 
 void
