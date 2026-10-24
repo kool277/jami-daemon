@@ -38,6 +38,8 @@ list (APPEND Source_Files__media
       "${CMAKE_CURRENT_SOURCE_DIR}/recordable.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/recordable.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/rtp_session.h"
+      "${CMAKE_CURRENT_SOURCE_DIR}/dtls_srtp_transport.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/dtls_srtp_transport.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/socket_pair.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/socket_pair.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/srtp.c"

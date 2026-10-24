@@ -116,6 +116,21 @@ test(
     timeout: 1800,
 )
 
+ut_dtls_srtp_transport = executable(
+    'ut_dtls_srtp_transport',
+    sources: files('unitTest/media/test_dtls_srtp_transport.cpp'),
+    include_directories: ut_includedirs,
+    dependencies: ut_dependencies,
+    link_with: ut_library,
+)
+test(
+    'dtls_srtp_transport',
+    ut_dtls_srtp_transport,
+    workdir: ut_workdir,
+    is_parallel: false,
+    timeout: 1800,
+)
+
 ut_sdes_negotiator = executable(
     'ut_sdes_negotiator',
     sources: files('unitTest/sip/sdes_negotiator.cpp'),
