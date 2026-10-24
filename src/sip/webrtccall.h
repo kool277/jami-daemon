@@ -112,6 +112,7 @@ public:
     // Call
     bool isMeshLeg() const override { return group_ and group_->isMesh(); }
     void applyHostMedia(bool audioMuted, bool videoMuted, bool detached, const std::string& videoSource) override;
+    bool writesCallHistory() const override { return not group_; }
     void exitConference() override;
     void answer(const std::vector<libjami::MediaMap>& mediaList) override;
     void hangup(int code) override;

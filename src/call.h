@@ -343,6 +343,10 @@ public:
                                 const std::string& /*videoSource*/)
     {}
 
+    // Whether an outgoing call adds its history to the conversation with its
+    // peer when it ends; not a leg of a group call, which is no call to it.
+    virtual bool writesCallHistory() const { return true; }
+
     ///
     /// Return true if this call instance is a subcall (internal call for multi-device handling)
     ///
