@@ -103,7 +103,14 @@ WebRtcCallTest::incomingCallsNameTheirAccount()
                                                                     PEER,
                                                                     [](const std::string&, Json::Value&&) {});
     CPPUNIT_ASSERT(call);
-    CPPUNIT_ASSERT_EQUAL(account->getUsername(), call->getDetails()[libjami::Call::Details::TO_USERNAME]);
+    call->setPeerNumber(PEER);
+    auto details = call->getDetails();
+    CPPUNIT_ASSERT_EQUAL(account->getUsername(), details[libjami::Call::Details::TO_USERNAME]);
+    // And its peer as an incoming SIP call names it, from its From header.
+    // The apps take a bare URI for a SIP peer, without a name of its own:
+    // jami-client-qt then named the caller's contact after the URI, and
+    // saved that name.
+    CPPUNIT_ASSERT_EQUAL(PEER + "@ring.dht", details[libjami::Call::Details::PEER_NUMBER]);
     Manager::instance().callFactory.removeCall(*call);
 }
 
