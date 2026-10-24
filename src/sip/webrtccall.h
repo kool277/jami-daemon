@@ -111,6 +111,8 @@ public:
 
     // Call
     bool isMeshLeg() const override { return group_ and group_->isMesh(); }
+    void applyHostMedia(bool audioMuted, bool videoMuted, bool detached, const std::string& videoSource) override;
+    void exitConference() override;
     void answer(const std::vector<libjami::MediaMap>& mediaList) override;
     void hangup(int code) override;
     void refuse() override;
@@ -198,6 +200,9 @@ private:
     // Fails the call unless a negotiation completes in time. Called with
     // callMutex_ held.
     void armTimeout(const char* reason);
+    // Whether a stream sends nothing: muted, on hold, or, for a mesh leg, as
+    // the conference's host is. Called with callMutex_ held.
+    bool sendMuted(const RtpStream& stream) const;
     std::vector<std::string> codecPreference(MediaType type) const;
 
     const std::string conversationId_;
@@ -217,6 +222,11 @@ private:
     bool exited_ {false};
     // The peer left (a group leg tells its group).
     bool peerLeft_ {false};
+    // A mesh leg in a conference: the host's audio or video is muted, or the
+    // host is detached (see applyHostMedia).
+    bool hostAudioMuted_ {false};
+    bool hostVideoMuted_ {false};
+    bool hostDetached_ {false};
     std::optional<DtlsIdentity> identity_;
     std::vector<Media> media_;
     // The last description sent, to answer a new offer alike.

@@ -333,6 +333,16 @@ public:
     // device's own.
     virtual bool isMeshLeg() const { return false; }
 
+    // For a mesh leg, which sends the host's sources itself rather than the
+    // conference's mix: the state of the conference's host, whose audio or
+    // video is muted, or who is detached (the conference is on hold), and its
+    // video source. The conference calls it whenever these change.
+    virtual void applyHostMedia(bool /*audioMuted*/,
+                                bool /*videoMuted*/,
+                                bool /*detached*/,
+                                const std::string& /*videoSource*/)
+    {}
+
     ///
     /// Return true if this call instance is a subcall (internal call for multi-device handling)
     ///

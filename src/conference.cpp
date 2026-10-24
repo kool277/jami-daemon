@@ -525,6 +525,24 @@ Conference::takeOverMediaSourceControl(const std::string& callId)
     }
 }
 
+void
+Conference::updateMeshLegs()
+{
+    // Detached (on hold), the host sends nothing; its mute state then stays
+    // what it was (the media list kept for its return).
+    bool detached = getState() != State::ACTIVE_ATTACHED;
+    bool audioMuted = not detached and (isMuted("host"sv) or isMediaSourceMuted(MediaType::MEDIA_AUDIO));
+    bool videoMuted = not detached and isMediaSourceMuted(MediaType::MEDIA_VIDEO);
+    std::string source;
+#ifdef ENABLE_VIDEO
+    source = getVideoInput();
+#endif
+    for (const auto& callId : getSubCalls()) {
+        if (auto call = getCall(callId); call and call->isMeshLeg())
+            call->applyHostMedia(audioMuted, videoMuted, detached, source);
+    }
+}
+
 bool
 Conference::requestMediaChange(const std::vector<libjami::MediaMap>& mediaList)
 {
@@ -638,6 +656,7 @@ Conference::requestMediaChange(const std::vector<libjami::MediaMap>& mediaList)
     }
 #endif
     hostSources_ = mediaAttrList; // New medias
+    updateMeshLegs();
     if (!isMuted("host"sv) && !isMediaSourceMuted(MediaType::MEDIA_AUDIO))
         bindHostAudio();
 
@@ -803,6 +822,7 @@ Conference::addSubCall(const std::string& callId)
             }
         }
         bindSubCallAudio(callId);
+        updateMeshLegs();
 #endif // ENABLE_VIDEO
     } else
         JAMI_ERROR("[conf:{}] No call associated with participant {}", id_, callId);
@@ -1063,6 +1083,7 @@ Conference::attachHost(const std::vector<libjami::MediaMap>& mediaList)
         } else {
             requestMediaChange(mediaList);
         }
+        updateMeshLegs();
     } else {
         JAMI_WARNING("[conf:{}] Invalid conference state in attach participant: current \"{}\" - expected \"{}\"",
                      id_,
@@ -1095,6 +1116,7 @@ Conference::detachHost()
 
     setState(State::ACTIVE_DETACHED);
     initSourcesForHost();
+    updateMeshLegs();
 }
 
 CallIdSet
@@ -1154,6 +1176,7 @@ Conference::switchInput(const std::string& input)
     if (not isVideoEnabled())
         return;
 
+    updateMeshLegs();
     if (auto mixer = videoMixer_) {
         mixer->switchInputs({input});
 #ifdef ENABLE_PLUGIN
@@ -1467,6 +1490,7 @@ Conference::muteHost(bool state)
         }
     }
     updateMuted();
+    updateMeshLegs();
 }
 
 void
@@ -1665,6 +1689,7 @@ Conference::muteLocalHost(bool is_muted, const std::string& mediaType)
         }
         setLocalHostMuteState(MediaType::MEDIA_AUDIO, is_muted);
         updateMuted();
+        updateMeshLegs();
         emitSignal<libjami::CallSignal::AudioMuted>(id_, is_muted);
         return;
     } else if (mediaType.compare(libjami::Media::Details::MEDIA_TYPE_VIDEO) == 0) {
@@ -1693,6 +1718,7 @@ Conference::muteLocalHost(bool is_muted, const std::string& mediaType)
                 mixer->switchInputs(videoInputs);
             }
         }
+        updateMeshLegs();
         emitSignal<libjami::CallSignal::VideoMuted>(id_, is_muted);
         return;
 #endif

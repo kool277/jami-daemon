@@ -1179,6 +1179,12 @@ WebRtcCall::startMedia(size_t index, const SrtpKeys& keys)
         local.receiving_sdp = webrtc::receivingSdp(type, m.codec);
 
         configureRtpSession(stream.rtpSession_, stream.mediaAttribute_, local, remote);
+        // configureRtpSession mutes by the media's own state: a leg on hold,
+        // or a mesh leg whose conference host is muted or detached, sends
+        // nothing either.
+        stream.rtpSession_->setMuted(sendMuted(stream), RtpSession::Direction::SEND);
+        if (stream.mediaAttribute_->hold_ and type == MediaType::MEDIA_VIDEO)
+            stream.rtpSession_->setMuted(true, RtpSession::Direction::RECV);
         stream.remoteMediaAttribute_ = std::make_shared<MediaAttribute>(type,
                                                                         false,
                                                                         true,
@@ -1309,7 +1315,7 @@ WebRtcCall::resume(OnReadyCb&& cb)
         std::lock_guard lk {callMutex_};
         for (auto& stream : rtpStreams_) {
             stream.mediaAttribute_->hold_ = false;
-            stream.rtpSession_->setMuted(stream.mediaAttribute_->muted_, RtpSession::Direction::SEND);
+            stream.rtpSession_->setMuted(sendMuted(stream), RtpSession::Direction::SEND);
             if (stream.mediaAttribute_->type_ == MediaType::MEDIA_VIDEO)
                 stream.rtpSession_->setMuted(false, RtpSession::Direction::RECV);
         }
@@ -1345,7 +1351,7 @@ WebRtcCall::requestMediaChange(const std::vector<libjami::MediaMap>& mediaList)
             }
             if (attr.muted_ != current.muted_) {
                 current.muted_ = attr.muted_;
-                it->rtpSession_->setMuted(attr.muted_);
+                it->rtpSession_->setMuted(sendMuted(*it), RtpSession::Direction::SEND);
                 if (current.type_ == MediaType::MEDIA_AUDIO)
                     emitSignal<libjami::CallSignal::AudioMuted>(getCallId(), attr.muted_);
                 else
@@ -1374,6 +1380,78 @@ WebRtcCall::switchInput(const std::string& source)
         stream.rtpSession_->setMediaSource(source);
         stream.rtpSession_->restartSender();
     }
+}
+
+bool
+WebRtcCall::sendMuted(const RtpStream& stream) const
+{
+    const auto& media = *stream.mediaAttribute_;
+    if (media.muted_ or media.hold_ or hostDetached_)
+        return true;
+    return media.type_ == MediaType::MEDIA_VIDEO ? hostVideoMuted_ : hostAudioMuted_;
+}
+
+void
+WebRtcCall::applyHostMedia(bool audioMuted, bool videoMuted, bool detached, const std::string& videoSource)
+{
+    if (not isMeshLeg())
+        return;
+    std::lock_guard lk {callMutex_};
+    hostAudioMuted_ = audioMuted;
+    hostVideoMuted_ = videoMuted;
+    hostDetached_ = detached;
+    for (auto& stream : rtpStreams_) {
+        auto muted = sendMuted(stream);
+        if (stream.mediaAttribute_->type_ != MediaType::MEDIA_VIDEO) {
+            // The microphone reaches the legs through the conference, which
+            // unbinds it; other sources, such as a file, do not.
+            stream.rtpSession_->setMuted(muted, RtpSession::Direction::SEND);
+            continue;
+        }
+        if (not videoSource.empty() and videoSource != stream.mediaAttribute_->sourceUri_) {
+            stream.mediaAttribute_->sourceUri_ = videoSource;
+            stream.rtpSession_->setMediaSource(videoSource);
+            if (not muted)
+                stream.rtpSession_->restartSender();
+        }
+        stream.rtpSession_->setMuted(muted, RtpSession::Direction::SEND);
+    }
+}
+
+void
+WebRtcCall::exitConference()
+{
+    bool audioMuted = false;
+    bool videoMuted = false;
+    bool detached = false;
+    {
+        std::lock_guard lk {callMutex_};
+        if (isMeshLeg()) {
+            audioMuted = hostAudioMuted_;
+            videoMuted = hostVideoMuted_;
+            detached = hostDetached_;
+            // Alone with this member again, what the user muted in the
+            // conference stays muted (SIPCall::exitConference then leaves
+            // the microphone unbound).
+            for (auto& stream : rtpStreams_) {
+                auto& media = *stream.mediaAttribute_;
+                if (media.type_ == MediaType::MEDIA_VIDEO ? videoMuted : audioMuted)
+                    media.muted_ = true;
+            }
+        }
+        hostAudioMuted_ = false;
+        hostVideoMuted_ = false;
+        hostDetached_ = false;
+    }
+    if (audioMuted)
+        emitSignal<libjami::CallSignal::AudioMuted>(getCallId(), true);
+    if (videoMuted)
+        emitSignal<libjami::CallSignal::VideoMuted>(getCallId(), true);
+    SIPCall::exitConference();
+    // A conference on hold leaves this call on hold, not live again (with
+    // the microphone SIPCall::exitConference just bound).
+    if (detached and getState() == CallState::ACTIVE and hold({}))
+        Manager::instance().removeAudio(*this);
 }
 
 void
