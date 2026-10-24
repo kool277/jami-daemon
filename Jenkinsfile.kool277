@@ -76,7 +76,7 @@ pipeline {
         stage('Test') {
             steps {
                 sh '''"$CI/daemon/run.sh" ctest --test-dir build --output-on-failure \
-                        -R '^(base64|string_utils|utf8_utils|fileutils)$' \
+                        -R '^(base64|string_utils|utf8_utils|fileutils|socket_pair_mux|dtls_srtp_transport|webrtc_sdp|web_call_signaling)$' \
                         --output-junit /src/jami-daemon/build/ctest-smoke.xml'''
                 sh '"$CI/daemon/run.sh" dbus-run-session -- sh /ci/dbus-check.sh'
             }
