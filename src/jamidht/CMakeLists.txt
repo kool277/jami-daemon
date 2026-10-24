@@ -28,6 +28,8 @@ list (APPEND Source_Files__jamidht
       "${CMAKE_CURRENT_SOURCE_DIR}/gitsocket.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/jami_contact.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/jamiaccount.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/web_call_signaling.cpp"
+      "${CMAKE_CURRENT_SOURCE_DIR}/web_call_signaling.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/jamiaccount.h"
       "${CMAKE_CURRENT_SOURCE_DIR}/jamiaccount_config.cpp"
       "${CMAKE_CURRENT_SOURCE_DIR}/jamiaccount_config.h"

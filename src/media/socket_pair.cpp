@@ -76,6 +76,25 @@ static constexpr auto UDP_HEADER_SIZE = 8;
 static constexpr auto SRTP_OVERHEAD = 10;
 static constexpr uint32_t RTCP_RR_FRACTION_MASK = 0xFF000000;
 static constexpr unsigned MINIMUM_RTP_HEADER_SIZE = 16;
+// Packets waiting for the receiver thread on a multiplexed transport; older
+// ones are dropped beyond this, so a stalled receiver cannot grow memory.
+static constexpr size_t MAX_QUEUED_PACKETS = 1024;
+
+static uint32_t
+readUint32(const uint8_t* buf)
+{
+    return static_cast<uint32_t>(buf[0]) << 24 | static_cast<uint32_t>(buf[1]) << 16
+           | static_cast<uint32_t>(buf[2]) << 8 | buf[3];
+}
+
+static void
+writeUint32(uint8_t* buf, uint32_t value)
+{
+    buf[0] = value >> 24;
+    buf[1] = value >> 16;
+    buf[2] = value >> 8;
+    buf[3] = value;
+}
 
 enum class DataType : uint8_t { RTP = 1 << 0, RTCP = 1 << 1 };
 
@@ -199,6 +218,24 @@ SocketPair::SocketPair(std::unique_ptr<dhtnet::IceSocket> rtp_sock, std::unique_
     });
 }
 
+SocketPair::SocketPair(std::shared_ptr<RtpMuxTransport> transport)
+    : muxTransport_(std::move(transport))
+{
+    JAMI_LOG("[{}] Creating instance with RTP and RTCP multiplexed", fmt::ptr(this));
+
+    muxTransport_->setOnPacket([this](const uint8_t* buf, size_t len) {
+        // RFC 5761 section 4: RTCP packet types are 192-223, a range RTP
+        // payload types avoid when multiplexed with RTCP.
+        bool isRtcp = len >= 2 and buf[1] >= 192 and buf[1] <= 223;
+        std::lock_guard l(dataBuffMutex_);
+        auto& queue = isRtcp ? rtcpDataBuff_ : rtpDataBuff_;
+        if (queue.size() >= MAX_QUEUED_PACKETS)
+            queue.pop_front();
+        queue.emplace_back(buf, buf + len);
+        cv_.notify_one();
+    });
+}
+
 SocketPair::~SocketPair()
 {
     interrupt();
@@ -289,6 +326,8 @@ SocketPair::interrupt()
         rtp_sock_->setOnRecv(nullptr);
     if (rtcp_sock_)
         rtcp_sock_->setOnRecv(nullptr);
+    if (muxTransport_)
+        muxTransport_->setOnPacket(nullptr);
     cv_.notify_all();
     cvRtcpPacketReadyToRead_.notify_all();
 }
@@ -358,6 +397,8 @@ SocketPair::createIOContext(const uint16_t mtu)
     unsigned ip_header_size;
     if (rtp_sock_)
         ip_header_size = rtp_sock_->getTransportOverhead();
+    else if (muxTransport_)
+        ip_header_size = muxTransport_->getTransportOverhead();
     else if (rtpDestAddr_.getFamily() == AF_INET6)
         ip_header_size = 40;
     else
@@ -479,82 +520,206 @@ SocketPair::readRtcpData(void* buf, int buf_size)
 }
 
 int
-SocketPair::readCallback(uint8_t* buf, int buf_size)
+SocketPair::readMuxed(uint8_t* buf, int buf_size)
 {
-    auto datatype = waitForData();
-    if (datatype < 0)
-        return datatype;
+    while (true) {
+        auto datatype = waitForData();
+        if (datatype < 0)
+            return datatype;
 
-    int len = 0;
-    bool fromRTCP = false;
+        int len = readRtcpData(buf, buf_size);
+        bool isRtcp = len > 0;
+        if (not isRtcp)
+            len = readRtpData(buf, buf_size);
+        if (len <= 0)
+            return len;
 
-    if (datatype & static_cast<int>(DataType::RTCP)) {
-        len = readRtcpData(buf, buf_size);
-        if (len > 0) {
-            auto* header = reinterpret_cast<rtcpRRHeader*>(buf);
-            // 201 = RR PT
-            if (header->pt == 201) {
-                lastDLSR_ = Swap4Bytes(header->dlsr);
-                // JAMI_WARN("Read RR, lastDLSR : %d", lastDLSR_);
-                lastRR_time = std::chrono::steady_clock::now();
-                saveRtcpRRPacket(buf, len);
-            }
-            // 206 = REMB PT
-            else if (header->pt == 206)
-                saveRtcpREMBPacket(buf, len);
-            // 200 = SR PT
-            else if (header->pt == 200) {
-                // not used yet
-            } else {
-                unsigned pt = header->pt;
-                JAMI_LOG("Unable to read RTCP: unknown packet type {}", pt);
-            }
-            fromRTCP = true;
+        // Without keys nothing can be authenticated, so nothing is used.
+        if (not srtpContext_ or not srtpContext_->srtp_in.aes)
+            continue;
+
+        if (isRtcp) {
+            if (ff_srtp_decrypt(&srtpContext_->srtp_in, buf, &len) < 0 or len <= 0)
+                continue;
+            handleMuxedRtcp(buf, len);
+            return len;
         }
-    }
 
-    // No RTCP… attempt RTP
-    if (!len and (datatype & static_cast<int>(DataType::RTP))) {
-        len = readRtpData(buf, buf_size);
-        fromRTCP = false;
-    }
+        if (len < static_cast<int>(MINIMUM_RTP_HEADER_SIZE))
+            continue;
 
-    if (len <= 0)
-        return len;
+        if (ff_srtp_decrypt(&srtpContext_->srtp_in, buf, &len) < 0 or len <= 0)
+            continue;
 
-    if (not fromRTCP && (buf_size < static_cast<int>(MINIMUM_RTP_HEADER_SIZE)))
-        return len;
-
-    // SRTP decrypt
-    if (not fromRTCP and srtpContext_ and srtpContext_->srtp_in.aes) {
+        // The RTP header, extensions included, is authenticated, not encrypted.
+        float abs = 0.0f;
         int32_t gradient = 0;
         int32_t deltaT = 0;
-        float abs = 0.0f;
-        bool res_parse = false;
-        bool res_delay = false;
-
-        res_parse = parse_RTP_ext(buf, &abs);
-        bool marker = (buf[1] & 0x80) >> 7;
-
-        if (res_parse)
-            res_delay = getOneWayDelayGradient(abs, marker, &gradient, &deltaT);
-
-        // rtpDelayCallback_ is not set for audio
-        if (rtpDelayCallback_ and res_delay)
+        if (rtpDelayCallback_ and parse_RTP_ext(buf, &abs)
+            and getOneWayDelayGradient(abs, buf[1] & 0x80, &gradient, &deltaT))
             rtpDelayCallback_(gradient, deltaT);
 
-        auto err = ff_srtp_decrypt(&srtpContext_->srtp_in, buf, &len);
-        if (packetLossCallback_ and (buf[2] << 8 | buf[3]) != lastSeqNumIn_ + 1)
+        uint16_t seq = buf[2] << 8 | buf[3];
+        if (packetLossCallback_ and seq != static_cast<uint16_t>(lastSeqNumIn_ + 1))
             packetLossCallback_();
-        lastSeqNumIn_ = buf[2] << 8 | buf[3];
-        if (err < 0)
-            JAMI_WARNING("decrypt error {}", err);
-    }
-
-    if (len != 0)
+        lastSeqNumIn_ = seq;
+        lastSsrcIn_ = readUint32(buf + 8);
+        if (pliPending_.exchange(false))
+            sendPictureLossIndication();
         return len;
-    else
-        return AVERROR_EOF;
+    }
+}
+
+// Browsers send compound RTCP packets, for example a sender report followed
+// by SDES and a key frame request: read every packet of it.
+void
+SocketPair::handleMuxedRtcp(uint8_t* buf, size_t len)
+{
+    size_t offset = 0;
+    while (offset + 4 <= len) {
+        uint8_t* packet = buf + offset;
+        if ((packet[0] >> 6) != 2)
+            return;
+        size_t size = (static_cast<size_t>(packet[2] << 8 | packet[3]) + 1) * 4;
+        if (offset + size > len)
+            return;
+        handleRtcpPacket(packet, size);
+        offset += size;
+    }
+}
+
+void
+SocketPair::handleRtcpPacket(uint8_t* packet, size_t size)
+{
+    uint8_t count = packet[0] & 0x1F;
+    switch (packet[1]) {
+    case 200: {
+        // A sender report carries the reception reports a peer that also
+        // sends would otherwise put in a receiver report: read the first
+        // one like a receiver report.
+        constexpr size_t SR_HEADER_SIZE = 28;
+        constexpr size_t REPORT_BLOCK_SIZE = 24;
+        if (count == 0 or size < SR_HEADER_SIZE + REPORT_BLOCK_SIZE)
+            return;
+        uint8_t rr[sizeof(rtcpRRHeader)];
+        std::memcpy(rr, packet, 8);
+        rr[1] = 201;
+        std::memcpy(rr + 8, packet + SR_HEADER_SIZE, REPORT_BLOCK_SIZE);
+        auto* header = reinterpret_cast<rtcpRRHeader*>(rr);
+        lastDLSR_ = Swap4Bytes(header->dlsr);
+        lastRR_time = std::chrono::steady_clock::now();
+        saveRtcpRRPacket(rr, sizeof(rr));
+        break;
+    }
+    case 201:
+        if (count == 0 or size < sizeof(rtcpRRHeader))
+            return;
+        lastDLSR_ = Swap4Bytes(reinterpret_cast<rtcpRRHeader*>(packet)->dlsr);
+        lastRR_time = std::chrono::steady_clock::now();
+        saveRtcpRRPacket(packet, size);
+        break;
+    case 206:
+        // Payload-specific feedback (RFC 4585, RFC 5104): 1 is a Picture
+        // Loss Indication, 4 a Full Intra Request, 15 an application
+        // message such as REMB.
+        if (count == 1 or count == 4) {
+            if (keyFrameRequestCallback_)
+                keyFrameRequestCallback_();
+        } else if (count == 15) {
+            saveRtcpREMBPacket(packet, size);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+int
+SocketPair::readCallback(uint8_t* buf, int buf_size)
+{
+    if (muxTransport_)
+        return readMuxed(buf, buf_size);
+
+    while (true) {
+        auto datatype = waitForData();
+        if (datatype < 0)
+            return datatype;
+
+        int len = 0;
+        bool fromRTCP = false;
+
+        if (datatype & static_cast<int>(DataType::RTCP)) {
+            len = readRtcpData(buf, buf_size);
+            if (len > 0) {
+                auto* header = reinterpret_cast<rtcpRRHeader*>(buf);
+                // 201 = RR PT
+                if (header->pt == 201) {
+                    lastDLSR_ = Swap4Bytes(header->dlsr);
+                    // JAMI_WARN("Read RR, lastDLSR : %d", lastDLSR_);
+                    lastRR_time = std::chrono::steady_clock::now();
+                    saveRtcpRRPacket(buf, len);
+                }
+                // 206 = REMB PT
+                else if (header->pt == 206)
+                    saveRtcpREMBPacket(buf, len);
+                // 200 = SR PT
+                else if (header->pt == 200) {
+                    // not used yet
+                } else {
+                    unsigned pt = header->pt;
+                    JAMI_LOG("Unable to read RTCP: unknown packet type {}", pt);
+                }
+                fromRTCP = true;
+            }
+        }
+
+        // No RTCP… attempt RTP
+        if (!len and (datatype & static_cast<int>(DataType::RTP))) {
+            len = readRtpData(buf, buf_size);
+            fromRTCP = false;
+        }
+
+        if (len <= 0)
+            return len;
+
+        if (not fromRTCP && (buf_size < static_cast<int>(MINIMUM_RTP_HEADER_SIZE)))
+            return len;
+
+        // SRTP decrypt
+        if (not fromRTCP and srtpContext_ and srtpContext_->srtp_in.aes) {
+            int32_t gradient = 0;
+            int32_t deltaT = 0;
+            float abs = 0.0f;
+            bool res_parse = false;
+            bool res_delay = false;
+
+            res_parse = parse_RTP_ext(buf, &abs);
+            bool marker = (buf[1] & 0x80) >> 7;
+
+            if (res_parse)
+                res_delay = getOneWayDelayGradient(abs, marker, &gradient, &deltaT);
+
+            // rtpDelayCallback_ is not set for audio
+            if (rtpDelayCallback_ and res_delay)
+                rtpDelayCallback_(gradient, deltaT);
+
+            auto err = ff_srtp_decrypt(&srtpContext_->srtp_in, buf, &len);
+            if (packetLossCallback_ and (buf[2] << 8 | buf[3]) != lastSeqNumIn_ + 1)
+                packetLossCallback_();
+            lastSeqNumIn_ = buf[2] << 8 | buf[3];
+            if (err < 0) {
+                // Dropped, not taken for the end of the stream: a duplicate, a
+                // late or a stray packet would stop the receiver.
+                JAMI_WARNING("decrypt error {}", err);
+                continue;
+            }
+        }
+
+        if (len != 0)
+            return len;
+        else
+            return AVERROR_EOF;
+    }
 }
 
 int
@@ -588,11 +753,96 @@ SocketPair::writeData(uint8_t* buf, int buf_size)
     if (noWrite_)
         return buf_size;
 
+    if (muxTransport_) {
+        auto ret = muxTransport_->send(buf, buf_size);
+        if (ret < 0) {
+            errno = static_cast<int>(-ret);
+            return -1;
+        }
+        return static_cast<int>(ret);
+    }
+
     // IceSocket
     if (isRTCP)
         return static_cast<int>(rtcp_sock_->send(buf, buf_size));
     else
         return static_cast<int>(rtp_sock_->send(buf, buf_size));
+}
+
+// WebRTC peers require SRTCP: RTCP is encrypted like RTP, and nothing is sent
+// in clear, even before the keys are set.
+int
+SocketPair::encryptAndWrite(uint8_t* buf, int buf_size)
+{
+    bool isRTCP = RTP_PT_IS_RTCP(buf[1]);
+    if (isRTCP and static_cast<unsigned>(buf_size) >= sizeof(rtcpRRHeader)) {
+        auto* header = reinterpret_cast<rtcpRRHeader*>(buf);
+        rtcpPacketLoss_ = (header->pt == 201 && ntohl(header->fraction_lost) & RTCP_RR_FRACTION_MASK);
+    }
+    if (isRTCP and buf[1] == 200 and static_cast<unsigned>(buf_size) >= sizeof(rtcpSRHeader))
+        noteSentSenderReport(buf);
+    if (not isRTCP and buf_size >= 12)
+        lastSsrcOut_ = readUint32(buf + 8);
+
+    std::lock_guard lk(writeMutex_);
+    if (not srtpContext_ or not srtpContext_->srtp_out.aes)
+        return buf_size;
+
+    int size = ff_srtp_encrypt(&srtpContext_->srtp_out,
+                               buf,
+                               buf_size,
+                               srtpContext_->encryptbuf,
+                               sizeof(srtpContext_->encryptbuf));
+    if (size < 0) {
+        JAMI_WARNING("encrypt error {}", size);
+        return size;
+    }
+
+    if (interrupted_)
+        return -EINTR;
+    // A datagram the transport has no room for is dropped, as the network
+    // would: waiting would only make the media late (and hold writeMutex_).
+    int ret = writeData(srtpContext_->encryptbuf, size);
+    if (ret < 0 and errno == EAGAIN)
+        return buf_size;
+    return ret < 0 ? -errno : buf_size;
+}
+
+int
+SocketPair::writeRtcp(uint8_t* buf, int buf_size)
+{
+    // A WebRTC peer takes SRTCP only.
+    if (muxTransport_)
+        return encryptAndWrite(buf, buf_size);
+    return writeData(buf, buf_size);
+}
+
+void
+SocketPair::setKeyFrameRequestCallback(std::function<void()> cb)
+{
+    keyFrameRequestCallback_ = std::move(cb);
+}
+
+bool
+SocketPair::sendPictureLossIndication()
+{
+    if (not muxTransport_ or noWrite_)
+        return false;
+    uint32_t mediaSsrc = lastSsrcIn_;
+    if (not mediaSsrc) {
+        // Sent when the first packet names the stream.
+        pliPending_ = true;
+        return false;
+    }
+
+    // RFC 4585 section 6.3.1: V=2, FMT=1, PT=206 (payload-specific
+    // feedback), length 2 (in 32-bit words, minus one), sender SSRC, media
+    // SSRC. It is sent alone, as reduced-size RTCP (RFC 5506).
+    uint8_t pli[12] = {0x81, 206, 0, 2};
+    uint32_t senderSsrc = lastSsrcOut_;
+    writeUint32(pli + 4, senderSsrc ? senderSsrc : 1);
+    writeUint32(pli + 8, mediaSsrc);
+    return encryptAndWrite(pli, sizeof(pli)) > 0;
 }
 
 int
@@ -601,10 +851,11 @@ SocketPair::writeCallback(uint8_t* buf, int buf_size)
     if (noWrite_)
         return 0;
 
+    if (muxTransport_)
+        return encryptAndWrite(buf, buf_size);
+
     int ret;
     bool isRTCP = RTP_PT_IS_RTCP(buf[1]);
-    unsigned int ts_LSB, ts_MSB;
-    double currentSRTS, currentLatency;
 
     // Encrypt?
     if (not isRTCP and srtpContext_ and srtpContext_->srtp_out.aes) {
@@ -635,33 +886,28 @@ SocketPair::writeCallback(uint8_t* buf, int buf_size)
     } while (ret < 0 and errno == EAGAIN);
 
     if (buf[1] == 200) // Sender Report
-    {
-        auto* header = reinterpret_cast<rtcpSRHeader*>(buf);
-        ts_LSB = Swap4Bytes(header->timestampLSB);
-        ts_MSB = Swap4Bytes(header->timestampMSB);
-
-        currentSRTS = ts_MSB + (ts_LSB / pow(2, 32));
-
-        if (lastSRTS_ != 0 && lastDLSR_ != 0) {
-            if (histoLatency_.size() >= MAX_LIST_SIZE)
-                histoLatency_.pop_front();
-
-            currentLatency = (currentSRTS - lastSRTS_) / 2;
-            // JAMI_WARN("Current Latency : %f from sender %X", currentLatency, header->ssrc);
-            histoLatency_.push_back(currentLatency);
-        }
-
-        lastSRTS_ = currentSRTS;
-
-        // JAMI_WARN("SENDING NEW RTCP SR !! ");
-
-    } else if (buf[1] == 201) // Receiver Report
-    {
-        // auto header = reinterpret_cast<rtcpRRHeader*>(buf);
-        // JAMI_WARN("SENDING NEW RTCP RR !! ");
-    }
+        noteSentSenderReport(buf);
 
     return ret < 0 ? -errno : ret;
+}
+
+void
+SocketPair::noteSentSenderReport(const uint8_t* buf)
+{
+    const auto* header = reinterpret_cast<const rtcpSRHeader*>(buf);
+    unsigned int ts_LSB = Swap4Bytes(header->timestampLSB);
+    unsigned int ts_MSB = Swap4Bytes(header->timestampMSB);
+
+    double currentSRTS = ts_MSB + (ts_LSB / pow(2, 32));
+
+    if (lastSRTS_ != 0 && lastDLSR_ != 0) {
+        if (histoLatency_.size() >= MAX_LIST_SIZE)
+            histoLatency_.pop_front();
+
+        histoLatency_.push_back((currentSRTS - lastSRTS_) / 2);
+    }
+
+    lastSRTS_ = currentSRTS;
 }
 
 double
@@ -716,8 +962,17 @@ SocketPair::parse_RTP_ext(uint8_t* buf, float* abs)
     if (not(buf[0] & 0x10))
         return false;
 
+    // The fixed offsets below hold for the daemon's own packets only: no
+    // CSRC, and a first extension element of ID 3 with 3 bytes of
+    // abs-send-time. A browser's packets may carry other extensions.
+    if (buf[0] & 0x0F)
+        return false;
+
     uint16_t magic_word = (buf[12] << 8) + buf[13];
     if (magic_word != 0xBEDE)
+        return false;
+
+    if (buf[16] != ((3 << 4) | 2))
         return false;
 
     uint8_t sec = buf[17] >> 2;

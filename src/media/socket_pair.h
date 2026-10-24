@@ -49,6 +49,26 @@ namespace jami {
 
 class SRTPProtoContext;
 
+// A transport carrying RTP and RTCP on one socket (rtcp-mux, RFC 5761), such
+// as the ICE component of a WebRTC m-line, which also carries DTLS.
+class RtpMuxTransport
+{
+public:
+    using OnPacket = std::function<void(const uint8_t* buf, size_t len)>;
+
+    virtual ~RtpMuxTransport() = default;
+
+    // Sends one RTP or RTCP packet: the size sent, or a negative errno.
+    virtual ssize_t send(const uint8_t* buf, size_t len) = 0;
+
+    // Gives each RTP and RTCP packet received to cb; nullptr stops.
+    virtual void setOnPacket(OnPacket&& cb) = 0;
+
+    // Bytes the network adds to each packet sent (IP, UDP, TURN), as
+    // IceSocket::getTransportOverhead.
+    virtual uint16_t getTransportOverhead() const = 0;
+};
+
 typedef struct
 {
 #ifdef WORDS_BIGENDIAN
@@ -131,6 +151,10 @@ class SocketPair
 public:
     SocketPair(const char* uri, int localPort);
     SocketPair(std::unique_ptr<dhtnet::IceSocket> rtp_sock, std::unique_ptr<dhtnet::IceSocket> rtcp_sock);
+    // For WebRTC peers: RTP and RTCP share the transport, RTCP is encrypted
+    // too (SRTCP), every packet of a compound RTCP packet is read, and a
+    // packet that fails SRTP authentication is dropped.
+    explicit SocketPair(std::shared_ptr<RtpMuxTransport> transport);
     ~SocketPair();
 
     void interrupt();
@@ -177,7 +201,17 @@ public:
     void setPacketLossCallback(std::function<void(void)> cb) { packetLossCallback_ = std::move(cb); }
     void setRtpDelayCallback(std::function<void(int, int)> cb);
 
+    // Called when the peer asks for a key frame with RTCP (PLI or FIR).
+    void setKeyFrameRequestCallback(std::function<void()> cb);
+    // Asks the peer for a key frame with an RTCP Picture Loss Indication
+    // (RFC 4585), as WebRTC peers expect. A PLI names the stream it is
+    // about: until RTP was received, the request waits for the first packet
+    // and this returns false.
+    bool sendPictureLossIndication();
+
     int writeData(uint8_t* buf, int buf_size);
+    // An RTCP packet this side makes itself, such as a REMB.
+    int writeRtcp(uint8_t* buf, int buf_size);
 
     uint16_t lastSeqValOut();
 
@@ -194,6 +228,11 @@ private:
     int readRtcpData(void* buf, int buf_size);
     void saveRtcpRRPacket(uint8_t* buf, size_t len);
     void saveRtcpREMBPacket(uint8_t* buf, size_t len);
+    void handleRtcpPacket(uint8_t* buf, size_t len);
+    void handleMuxedRtcp(uint8_t* buf, size_t len);
+    int readMuxed(uint8_t* buf, int buf_size);
+    int encryptAndWrite(uint8_t* buf, int buf_size);
+    void noteSentSenderReport(const uint8_t* buf);
 
     std::mutex dataBuffMutex_;
     std::condition_variable cv_;
@@ -202,6 +241,14 @@ private:
 
     std::unique_ptr<dhtnet::IceSocket> rtp_sock_;
     std::unique_ptr<dhtnet::IceSocket> rtcp_sock_;
+    std::shared_ptr<RtpMuxTransport> muxTransport_;
+    // Writes come from the sender thread and from key frame requests: they
+    // share the SRTP context and its output buffer.
+    std::mutex writeMutex_;
+    std::function<void()> keyFrameRequestCallback_;
+    std::atomic<uint32_t> lastSsrcIn_ {0};
+    std::atomic_bool pliPending_ {false};
+    std::atomic<uint32_t> lastSsrcOut_ {0};
 
     int rtpHandle_ {-1};
     int rtcpHandle_ {-1};

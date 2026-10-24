@@ -22,6 +22,7 @@
 #include "media_stream.h"
 #include "threadloop.h"
 
+#include <atomic>
 #include <string>
 #include <memory>
 
@@ -76,6 +77,7 @@ public:
     void updateMedia(const MediaDescription& send, const MediaDescription& receive) override;
 
     void start(std::unique_ptr<dhtnet::IceSocket> rtp_sock, std::unique_ptr<dhtnet::IceSocket> rtcp_sock) override;
+    void start(std::unique_ptr<SocketPair> socketPair) override;
     void restartSender() override;
     void stop() override;
     void setMuted(bool mute, Direction dir = Direction::SEND) override;
@@ -89,10 +91,16 @@ public:
      */
     void setRotation(int rotation);
     void forceKeyFrame();
+    // Asks the peer for a key frame with RTCP, as WebRTC peers expect. False
+    // when the transport cannot (SIP peers get a SIP INFO instead).
+    bool requestKeyFrameWithRtcp();
     void bindMixer(VideoMixer* mixer);
     void unbindMixer();
     void enterConference(Conference& conference);
     void exitConference();
+    // In a conference, still send the local video rather than the mix: the
+    // peer is a member of a mesh, which gets each member's video directly.
+    void setLocalSenderInConference(bool local) { localSenderInConference_ = local; }
 
     void setChangeOrientationCallback(std::function<void(int)> cb);
     void initRecorder() override;
@@ -170,6 +178,9 @@ private:
     time_point last_REMB_inc_ {time_point::min()};
     time_point last_REMB_dec_ {time_point::min()};
     time_point lastBitrateDecrease {clock::now()};
+    // When the peer's last honored key frame request came (clock ticks).
+    std::atomic<clock::rep> lastPeerKeyFrameRequest_ {0};
+    bool localSenderInConference_ {false};
 
     unsigned remb_dec_cnt_ {0};
 

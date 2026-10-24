@@ -40,7 +40,10 @@ enum InitFlag : uint16_t {
     LIBJAMI_FLAG_NO_LOCAL_VIDEO = 1 << 7,
     LIBJAMI_FLAG_NO_LOCAL_MEDIA = LIBJAMI_FLAG_NO_LOCAL_AUDIO | LIBJAMI_FLAG_NO_LOCAL_VIDEO,
     LIBJAMI_FLAG_NO_AUTOSYNC = 1 << 8,
-    LIBJAMI_FLAG_NO_AUTOLOAD = 1 << 9 // disable auto loading of accounts and conversations
+    LIBJAMI_FLAG_NO_AUTOLOAD = 1 << 9, // disable auto loading of accounts and conversations
+    // The app handles the web client's call messages itself, as the web
+    // client's server does: they reach it as account messages.
+    LIBJAMI_FLAG_NO_WEB_CALLS = 1 << 10
 };
 
 /**

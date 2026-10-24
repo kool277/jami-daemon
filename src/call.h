@@ -328,6 +328,25 @@ public:
      */
     void addSubCall(Call& call);
 
+    // A leg of a mesh, such as a web client's group call: its peer gets each
+    // other member's media directly, so a conference sends it only this
+    // device's own.
+    virtual bool isMeshLeg() const { return false; }
+
+    // For a mesh leg, which sends the host's sources itself rather than the
+    // conference's mix: the state of the conference's host, whose audio or
+    // video is muted, or who is detached (the conference is on hold), and its
+    // video source. The conference calls it whenever these change.
+    virtual void applyHostMedia(bool /*audioMuted*/,
+                                bool /*videoMuted*/,
+                                bool /*detached*/,
+                                const std::string& /*videoSource*/)
+    {}
+
+    // Whether an outgoing call adds its history to the conversation with its
+    // peer when it ends; not a leg of a group call, which is no call to it.
+    virtual bool writesCallHistory() const { return true; }
+
     ///
     /// Return true if this call instance is a subcall (internal call for multi-device handling)
     ///
@@ -440,6 +459,8 @@ protected:
     using clock = std::chrono::steady_clock;
     using time_point = clock::time_point;
     virtual void merge(Call& scall);
+    // Hangs up the calls to the peer's devices that have not answered.
+    void hangupSubcalls(int code = 0);
 
     /**
      * Constructor of a call

@@ -52,6 +52,25 @@ public:
                                         const std::vector<libjami::MediaMap>& mediaList);
 
     /**
+     * Create a call of a SIPCall subclass, such as WebRtcCall, registered
+     * like a SIPCall. Its constructor takes the account and the call ID,
+     * then args.
+     */
+    template<class C, class A, class... Args>
+    std::shared_ptr<C> newCall(const std::shared_ptr<A>& account, Args&&... args)
+    {
+        if (not allowNewCall_)
+            return {};
+
+        std::lock_guard lk(callMapsMutex_);
+        auto id = getNewCallID();
+        auto call = std::make_shared<C>(account, id, std::forward<Args>(args)...);
+        callMaps_[call->getLinkType()].emplace(id, call);
+        account->attach(call);
+        return call;
+    }
+
+    /**
      * Forbid creation of new calls.
      */
     void forbid();

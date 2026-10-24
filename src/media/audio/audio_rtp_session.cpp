@@ -204,6 +204,7 @@ AudioRtpSession::start(std::unique_ptr<dhtnet::IceSocket> rtp_sock, std::unique_
         return;
     }
 
+    std::unique_ptr<SocketPair> socketPair;
     try {
         if (rtp_sock and rtcp_sock) {
             if (send_.addr) {
@@ -215,21 +216,36 @@ AudioRtpSession::start(std::unique_ptr<dhtnet::IceSocket> rtp_sock, std::unique_
                 rtcp_sock->setDefaultRemoteAddress(rtcpAddr);
             }
 
-            socketPair_.reset(new SocketPair(std::move(rtp_sock), std::move(rtcp_sock)));
+            socketPair.reset(new SocketPair(std::move(rtp_sock), std::move(rtcp_sock)));
         } else {
-            socketPair_.reset(new SocketPair(getRemoteRtpUri().c_str(), receive_.addr.getPort()));
+            socketPair.reset(new SocketPair(getRemoteRtpUri().c_str(), receive_.addr.getPort()));
         }
 
         if (send_.crypto and receive_.crypto) {
-            socketPair_->createSRTP(receive_.crypto.getCryptoSuite().c_str(),
-                                    receive_.crypto.getSrtpKeyInfo().c_str(),
-                                    send_.crypto.getCryptoSuite().c_str(),
-                                    send_.crypto.getSrtpKeyInfo().c_str());
+            socketPair->createSRTP(receive_.crypto.getCryptoSuite().c_str(),
+                                   receive_.crypto.getSrtpKeyInfo().c_str(),
+                                   send_.crypto.getCryptoSuite().c_str(),
+                                   send_.crypto.getSrtpKeyInfo().c_str());
         }
     } catch (const std::runtime_error& e) {
         JAMI_ERROR("Socket creation failed: {}", e.what());
         return;
     }
+
+    start(std::move(socketPair));
+}
+
+void
+AudioRtpSession::start(std::unique_ptr<SocketPair> socketPair)
+{
+    std::lock_guard lock(mutex_);
+
+    if (not send_.enabled and not receive_.enabled) {
+        stop();
+        return;
+    }
+
+    socketPair_ = std::move(socketPair);
 
     startSender();
     startReceiver();

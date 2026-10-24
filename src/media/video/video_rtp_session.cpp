@@ -31,6 +31,7 @@
 #include "congestion_control.h"
 
 #include <dhtnet/ice_socket.h>
+#include <opendht/thread_pool.h>
 #include <asio/post.hpp>
 #include <asio/io_context.hpp>
 
@@ -48,6 +49,8 @@ constexpr auto DELAY_AFTER_RESTART = std::chrono::milliseconds(1000);
 constexpr auto EXPIRY_TIME_RTCP = std::chrono::seconds(2);
 constexpr auto DELAY_AFTER_REMB_INC = std::chrono::seconds(1);
 constexpr auto DELAY_AFTER_REMB_DEC = std::chrono::milliseconds(500);
+// Key frame requests by RTCP (PLI, FIR) honored at most this often.
+constexpr auto PEER_KEYFRAME_REQUEST_INTERVAL = std::chrono::milliseconds(500);
 
 VideoRtpSession::VideoRtpSession(const string& callId,
                                  const string& streamId,
@@ -132,9 +135,10 @@ VideoRtpSession::startSender()
 {
     std::lock_guard lock(mutex_);
 
+    bool fromMixer = conference_ and not localSenderInConference_;
     JAMI_LOG("[{}] Start video RTP sender: input [{}] - muted [{}]",
              fmt::ptr(this),
-             conference_ ? "Video Mixer" : input_,
+             fromMixer ? "Video Mixer" : input_,
              send_.hold ? "YES" : "NO");
 
     if (not socketPair_) {
@@ -152,7 +156,7 @@ VideoRtpSession::startSender()
             JAMI_WARNING("[{}] Restarting video sender", fmt::ptr(this));
         }
 
-        if (not conference_) {
+        if (not fromMixer) {
             videoLocal_ = getVideoInput(input_);
             if (videoLocal_) {
                 videoLocal_->setRecorderCallback([w = weak_from_this()](const MediaStream& ms) {
@@ -268,7 +272,7 @@ VideoRtpSession::restartSender()
 
     startSender();
 
-    if (conference_)
+    if (conference_ and not localSenderInConference_)
         setupConferenceVideoPipeline(*conference_, Direction::SEND);
     else
         setupVideoPipeline();
@@ -418,6 +422,7 @@ VideoRtpSession::start(std::unique_ptr<dhtnet::IceSocket> rtp_sock, std::unique_
         return;
     }
 
+    std::unique_ptr<SocketPair> socketPair;
     try {
         if (rtp_sock and rtcp_sock) {
             if (send_.addr) {
@@ -428,33 +433,71 @@ VideoRtpSession::start(std::unique_ptr<dhtnet::IceSocket> rtp_sock, std::unique_
             if (rtcpAddr) {
                 rtcp_sock->setDefaultRemoteAddress(rtcpAddr);
             }
-            socketPair_.reset(new SocketPair(std::move(rtp_sock), std::move(rtcp_sock)));
+            socketPair.reset(new SocketPair(std::move(rtp_sock), std::move(rtcp_sock)));
         } else {
-            socketPair_.reset(new SocketPair(getRemoteRtpUri().c_str(), receive_.addr.getPort()));
+            socketPair.reset(new SocketPair(getRemoteRtpUri().c_str(), receive_.addr.getPort()));
         }
 
-        last_REMB_inc_ = clock::now();
-        last_REMB_dec_ = clock::now();
-
-        socketPair_->setRtpDelayCallback([&](int gradient, int deltaT) { delayMonitor(gradient, deltaT); });
-
         if (send_.crypto and receive_.crypto) {
-            socketPair_->createSRTP(receive_.crypto.getCryptoSuite().c_str(),
-                                    receive_.crypto.getSrtpKeyInfo().c_str(),
-                                    send_.crypto.getCryptoSuite().c_str(),
-                                    send_.crypto.getSrtpKeyInfo().c_str());
+            socketPair->createSRTP(receive_.crypto.getCryptoSuite().c_str(),
+                                   receive_.crypto.getSrtpKeyInfo().c_str(),
+                                   send_.crypto.getCryptoSuite().c_str(),
+                                   send_.crypto.getSrtpKeyInfo().c_str());
         }
     } catch (const std::runtime_error& e) {
         JAMI_ERROR("[{}] Socket creation failed: {}", fmt::ptr(this), e.what());
         return;
     }
 
+    start(std::move(socketPair));
+}
+
+void
+VideoRtpSession::start(std::unique_ptr<SocketPair> socketPair)
+{
+    std::lock_guard lock(mutex_);
+
+    if (not send_.enabled and not receive_.enabled) {
+        stop();
+        return;
+    }
+
+    socketPair_ = std::move(socketPair);
+
+    last_REMB_inc_ = clock::now();
+    last_REMB_dec_ = clock::now();
+
+    socketPair_->setRtpDelayCallback([&](int gradient, int deltaT) { delayMonitor(gradient, deltaT); });
+
+    // WebRTC peers ask for key frames with RTCP. The request arrives on the
+    // receive thread, which stop() waits for while holding mutex_, so the
+    // key frame is forced from another thread, as for SIP requests.
+    socketPair_->setKeyFrameRequestCallback([w = weak_from_this()] {
+        auto session = w.lock();
+        if (not session)
+            return;
+        // A browser asks again for each loss and until a key frame comes:
+        // one key frame (several times a delta frame) per interval at most.
+        auto now = clock::now().time_since_epoch().count();
+        auto last = session->lastPeerKeyFrameRequest_.load();
+        if (now - last < std::chrono::duration_cast<clock::duration>(PEER_KEYFRAME_REQUEST_INTERVAL).count()
+            or not session->lastPeerKeyFrameRequest_.compare_exchange_strong(last, now))
+            return;
+        dht::ThreadPool::io().run([w] {
+            if (auto session = w.lock())
+                session->forceKeyFrame();
+        });
+    });
+
     startReceiver();
     startSender();
 
     if (conference_) {
         if (send_.enabled and not send_.hold) {
-            setupConferenceVideoPipeline(*conference_, Direction::SEND);
+            if (localSenderInConference_)
+                setupVideoPipeline();
+            else
+                setupConferenceVideoPipeline(*conference_, Direction::SEND);
         }
         if (receive_.enabled and not receive_.hold) {
             setupConferenceVideoPipeline(*conference_, Direction::RECV);
@@ -538,6 +581,13 @@ VideoRtpSession::setMuted(bool mute, Direction dir)
             setupConferenceVideoPipeline(*conference_, Direction::RECV);
         }
     }
+}
+
+bool
+VideoRtpSession::requestKeyFrameWithRtcp()
+{
+    std::lock_guard lock(mutex_);
+    return socketPair_ and socketPair_->sendPictureLossIndication();
 }
 
 void
@@ -973,7 +1023,7 @@ VideoRtpSession::delayMonitor(int gradient, int deltaT)
             uint64_t br = 0x6803; // Decrease 3
             auto v = cc->createREMB(br);
             buf = &v[0];
-            socketPair_->writeData(buf, static_cast<int>(v.size()));
+            socketPair_->writeRtcp(buf, static_cast<int>(v.size()));
             last_REMB_inc_ = clock::now();
         }
     } else if (bwState == BandwidthUsage::bwNormal) {
@@ -983,7 +1033,7 @@ VideoRtpSession::delayMonitor(int gradient, int deltaT)
             uint64_t br = 0x7378; // INcrease
             auto v = cc->createREMB(br);
             buf = &v[0];
-            socketPair_->writeData(buf, static_cast<int>(v.size()));
+            socketPair_->writeRtcp(buf, static_cast<int>(v.size()));
             last_REMB_inc_ = clock::now();
         }
     }

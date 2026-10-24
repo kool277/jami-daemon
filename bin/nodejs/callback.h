@@ -297,10 +297,12 @@ volatileDetailsChanged(const std::string& accountId, const std::map<std::string,
     uv_async_send(&signalAsync);
 }
 
+// In the order of ConfigurationSignal::IncomingAccountMessage: the sender
+// comes before the message ID, and JavaScript gets the sender.
 void
 incomingAccountMessage(const std::string& accountId,
-                       const std::string& messageId,
                        const std::string& from,
+                       const std::string& messageId,
                        const std::map<std::string, std::string>& payloads)
 {
     std::lock_guard lock(pendingSignalsLock);

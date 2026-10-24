@@ -548,6 +548,11 @@ private:
      */
     void takeOverMediaSourceControl(const std::string& callId);
 
+    // The legs of a mesh (Call::isMeshLeg) send the host's sources
+    // themselves, not the mix: when the host is muted, detached or switches
+    // its camera, they must follow (Call::applyHostMedia).
+    void updateMeshLegs();
+
     /**
      * Bind host's audio
      */

@@ -322,6 +322,9 @@ struct Manager::ManagerPimpl
     std::shared_ptr<dhtnet::upnp::UPnPContext> upnpContext_;
 
     std::atomic_bool autoAnswer_ {false};
+    // Whether calls with the web client's users are taken here (see
+    // WebCallSignaling), from the init flags.
+    std::atomic_bool takesWebCalls_ {true};
 
     /** Application wide tone controller */
     ToneControl toneCtrl_;
@@ -810,6 +813,14 @@ Manager::init(const std::filesystem::path& config_file, libjami::InitFlag flags)
 
     // manager can restart without being recreated (Unit tests)
     pimpl_->finished_ = false;
+
+    // Not by an app that handles them (the web client's server), nor without
+    // microphone and camera, nor in the iOS notification extension, which
+    // rings for nothing.
+    pimpl_->takesWebCalls_ = not(flags & libjami::LIBJAMI_FLAG_NO_WEB_CALLS)
+                             and not(flags & libjami::LIBJAMI_FLAG_IOS_EXTENSION)
+                             and (flags & libjami::LIBJAMI_FLAG_NO_LOCAL_MEDIA)
+                                     != libjami::LIBJAMI_FLAG_NO_LOCAL_MEDIA;
 
     // Create video manager
     if (!(flags & libjami::LIBJAMI_FLAG_NO_LOCAL_VIDEO)) {
@@ -1882,6 +1893,12 @@ Manager::playDtmf(char code)
 }
 
 // Multi-thread
+bool
+Manager::takesWebCalls() const
+{
+    return pimpl_->takesWebCalls_;
+}
+
 bool
 Manager::incomingCallsWaiting()
 {

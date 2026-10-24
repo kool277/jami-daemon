@@ -525,6 +525,24 @@ Conference::takeOverMediaSourceControl(const std::string& callId)
     }
 }
 
+void
+Conference::updateMeshLegs()
+{
+    // Detached (on hold), the host sends nothing; its mute state then stays
+    // what it was (the media list kept for its return).
+    bool detached = getState() != State::ACTIVE_ATTACHED;
+    bool audioMuted = not detached and (isMuted("host"sv) or isMediaSourceMuted(MediaType::MEDIA_AUDIO));
+    bool videoMuted = not detached and isMediaSourceMuted(MediaType::MEDIA_VIDEO);
+    std::string source;
+#ifdef ENABLE_VIDEO
+    source = getVideoInput();
+#endif
+    for (const auto& callId : getSubCalls()) {
+        if (auto call = getCall(callId); call and call->isMeshLeg())
+            call->applyHostMedia(audioMuted, videoMuted, detached, source);
+    }
+}
+
 bool
 Conference::requestMediaChange(const std::vector<libjami::MediaMap>& mediaList)
 {
@@ -638,6 +656,7 @@ Conference::requestMediaChange(const std::vector<libjami::MediaMap>& mediaList)
     }
 #endif
     hostSources_ = mediaAttrList; // New medias
+    updateMeshLegs();
     if (!isMuted("host"sv) && !isMediaSourceMuted(MediaType::MEDIA_AUDIO))
         bindHostAudio();
 
@@ -803,6 +822,7 @@ Conference::addSubCall(const std::string& callId)
             }
         }
         bindSubCallAudio(callId);
+        updateMeshLegs();
 #endif // ENABLE_VIDEO
     } else
         JAMI_ERROR("[conf:{}] No call associated with participant {}", id_, callId);
@@ -1063,6 +1083,7 @@ Conference::attachHost(const std::vector<libjami::MediaMap>& mediaList)
         } else {
             requestMediaChange(mediaList);
         }
+        updateMeshLegs();
     } else {
         JAMI_WARNING("[conf:{}] Invalid conference state in attach participant: current \"{}\" - expected \"{}\"",
                      id_,
@@ -1095,6 +1116,7 @@ Conference::detachHost()
 
     setState(State::ACTIVE_DETACHED);
     initSourcesForHost();
+    updateMeshLegs();
 }
 
 CallIdSet
@@ -1154,6 +1176,7 @@ Conference::switchInput(const std::string& input)
     if (not isVideoEnabled())
         return;
 
+    updateMeshLegs();
     if (auto mixer = videoMixer_) {
         mixer->switchInputs({input});
 #ifdef ENABLE_PLUGIN
@@ -1467,6 +1490,7 @@ Conference::muteHost(bool state)
         }
     }
     updateMuted();
+    updateMeshLegs();
 }
 
 void
@@ -1665,6 +1689,7 @@ Conference::muteLocalHost(bool is_muted, const std::string& mediaType)
         }
         setLocalHostMuteState(MediaType::MEDIA_AUDIO, is_muted);
         updateMuted();
+        updateMeshLegs();
         emitSignal<libjami::CallSignal::AudioMuted>(id_, is_muted);
         return;
     } else if (mediaType.compare(libjami::Media::Details::MEDIA_TYPE_VIDEO) == 0) {
@@ -1693,6 +1718,7 @@ Conference::muteLocalHost(bool is_muted, const std::string& mediaType)
                 mixer->switchInputs(videoInputs);
             }
         }
+        updateMeshLegs();
         emitSignal<libjami::CallSignal::VideoMuted>(id_, is_muted);
         return;
 #endif
@@ -1835,11 +1861,14 @@ Conference::getCallWith(const std::string& accountUri, const std::string& device
 std::string
 Conference::getRemoteId(const std::shared_ptr<jami::Call>& call) const
 {
-    if (auto* transport = std::dynamic_pointer_cast<SIPCall>(call)->getTransport())
+    if (auto* transport = std::dynamic_pointer_cast<SIPCall>(call)->getTransport()) {
         if (auto cert = transport->getTlsInfos().peerCert)
             if (cert->issuer)
                 return cert->issuer->getId().toString();
-    return {};
+        return {};
+    }
+    // A call without SIP, such as a web client's: the peer's account.
+    return call->getPeerNumber();
 }
 
 void
@@ -2038,6 +2067,9 @@ Conference::bindSubCallAudio(const std::string& callId)
         auto otherCall = getCall(otherId);
         if (!otherCall)
             continue;
+        // Members of a mesh hear each other directly.
+        if (participantCall->isMeshLeg() and otherCall->isMeshLeg())
+            continue;
 
         const bool otherMuted = isMuted(otherId);
         const auto otherStreams = otherCall->getRemoteAudioStreams();
@@ -2170,13 +2202,9 @@ Conference::clearParticipantData(const std::string& callId)
         return;
     }
 
+    // A call without SIP, such as a web client's, has no device.
     auto* transport = call->getTransport();
-    if (!transport) {
-        JAMI_WARNING("[conf:{}] Unable to find transport for call {} to clear participant", id_, callId);
-        return;
-    }
-
-    const std::string deviceId = std::string(transport->deviceId());
+    const std::string deviceId = transport ? std::string(transport->deviceId()) : std::string {};
     const std::string participantId = getRemoteId(call);
 
     {

@@ -48,6 +48,8 @@
 #include "sip/sdp.h"
 #include "sip/sipvoiplink.h"
 #include "sip/sipcall.h"
+#include "jamidht/web_call_signaling.h"
+#include "sip/webrtccall.h"
 #include "sip/siptransport.h"
 #include "connectivity/sip_utils.h"
 
@@ -434,26 +436,38 @@ JamiAccount::newOutgoingCall(std::string_view toUrl, const std::vector<libjami::
 
     auto& manager = Manager::instance();
     std::shared_ptr<SIPCall> call;
+    {
+        std::shared_lock lkCM(connManagerMtx_);
+        if (!connectionManager_)
+            return {};
+    }
 
     // SIP allows sending empty invites, this use case is not used with Jami accounts.
-    if (not mediaList.empty()) {
-        call = manager.callFactory.newSipCall(shared(), Call::CallType::OUTGOING, mediaList);
-    } else {
+    auto medias = mediaList;
+    if (medias.empty()) {
         JAMI_WARNING("Media list is empty, setting a default list");
-        call = manager.callFactory.newSipCall(shared(),
-                                              Call::CallType::OUTGOING,
-                                              MediaAttribute::mediaAttributesToMediaMaps(
-                                                  createDefaultMediaList(isVideoEnabled())));
+        medias = MediaAttribute::mediaAttributesToMediaMaps(createDefaultMediaList(isVideoEnabled()));
     }
+    // A peer with a one-to-one conversation may answer in the web client too.
+    call = webCallSignaling().newOutgoingCall(uri.authority(), medias);
+    if (not call)
+        call = manager.callFactory.newSipCall(shared(), Call::CallType::OUTGOING, medias);
 
     if (not call)
         return {};
 
     std::shared_lock lkCM(connManagerMtx_);
-    if (!connectionManager_)
+    if (!connectionManager_) {
+        // The account stopped meanwhile.
+        lkCM.unlock();
+        call->removeCall();
         return {};
+    }
 
     connectionManager_->getIceOptions([call, w = weak(), uri = std::move(uri)](auto&& opts) {
+        // Answered in a browser meanwhile (see WebRtcCall): no SIP call.
+        if (call->getConnectionState() == Call::ConnectionState::CONNECTED)
+            return;
         if (call->isIceEnabled()) {
             if (not call->createIceMediaTransport(false)
                 or not call->initIceMediaTransport(true, std::forward<dhtnet::IceTransportOptions>(opts))) {
@@ -706,7 +720,9 @@ JamiAccount::startOutgoingCall(const std::shared_ptr<SIPCall>& call, const std::
     // TODO: for now, we automatically trust all explicitly called peers
     setCertificateStatus(toUri, dhtnet::tls::TrustStore::PermissionStatus::ALLOWED);
 
-    call->setState(Call::ConnectionState::TRYING);
+    // Refused once the call is answered, in a browser (see WebRtcCall).
+    if (not call->setState(Call::ConnectionState::TRYING))
+        return;
     std::weak_ptr<SIPCall> wCall = call;
 
     accountManager_->lookupAddress(toUri,
@@ -803,6 +819,9 @@ JamiAccount::startOutgoingCall(const std::shared_ptr<SIPCall>& call, const std::
         dev_call->setPeerNumber(call->getPeerNumber());
         dev_call->setSipTransport(transport, getContactHeader(transport));
         call->addSubCall(*dev_call);
+        // Refused: the call was answered or ended meanwhile.
+        if (dev_call->getState() == Call::CallState::OVER)
+            continue;
         dev_call->setIceMedia(call->getIceMedia());
 
         // Set the call in PROGRESSING State because the ICE session
@@ -2787,6 +2806,14 @@ JamiAccount::conversationOneToOneReceive(const std::string& convId, const std::s
                                      });
 }
 
+WebCallSignaling&
+JamiAccount::webCallSignaling()
+{
+    // Not in the constructor: it keeps a weak pointer to the account.
+    std::call_once(webCallSignalingOnce_, [this] { webCallSignaling_ = std::make_unique<WebCallSignaling>(*this); });
+    return *webCallSignaling_;
+}
+
 ConversationModule*
 JamiAccount::convModule(bool noCreation)
 {
@@ -4013,6 +4040,10 @@ JamiAccount::onMessageSent(
 dhtnet::IceTransportOptions
 JamiAccount::getIceOptions() const
 {
+    std::shared_lock lk(connManagerMtx_);
+    // The account may be shutting down.
+    if (not connectionManager_)
+        return {};
     return connectionManager_->getIceOptions();
 }
 
@@ -4295,6 +4326,9 @@ JamiAccount::handleMessage(const std::shared_ptr<dht::crypto::Certificate>& cert
                      from);
         return true;
     }
+    // The web client's call messages: calls with browsers.
+    if (m.first == "application/json" and webCallSignaling().onMessage(from, cert->getLongId().toString(), m.second))
+        return true;
     if (m.first == MIME_TYPE_GIT) {
         Json::Value json;
         if (!json::parse(m.second, json)) {

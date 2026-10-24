@@ -209,7 +209,7 @@ SIPCall::configureRtpSession(const std::shared_ptr<RtpSession>& rtpSession,
         throw std::runtime_error("Must have a valid RTP session");
 
     // Configure the media stream
-    auto new_mtu = sipTransport_->getTlsMtu();
+    auto new_mtu = SipTransport::getTlsMtu();
     rtpSession->setMtu(new_mtu);
     rtpSession->updateMedia(remoteMedia, localMedia);
 
@@ -3765,6 +3765,14 @@ SIPCall::resetTransport(std::shared_ptr<dhtnet::IceTransport>&& transport)
     if (transport) {
         dht::ThreadPool::io().run([transport = std::move(transport)]() mutable { transport.reset(); });
     }
+}
+
+void
+SIPCall::stopIceMedia()
+{
+    std::lock_guard lk(transportMtx_);
+    resetTransport(std::move(iceMedia_));
+    resetTransport(std::move(reinvIceMedia_));
 }
 
 void

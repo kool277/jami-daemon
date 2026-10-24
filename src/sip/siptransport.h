@@ -115,7 +115,7 @@ public:
     inline void setAccount(const std::shared_ptr<SIPAccountBase>& account) { account_ = account; }
     inline const std::weak_ptr<SIPAccountBase>& getAccount() const { return account_; }
 
-    uint16_t getTlsMtu();
+    static uint16_t getTlsMtu();
 
 private:
     NON_COPYABLE(SipTransport);

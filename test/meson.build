@@ -101,6 +101,66 @@ test(
     timeout: 1800,
 )
 
+ut_socket_pair_mux = executable(
+    'ut_socket_pair_mux',
+    sources: files('unitTest/media/test_socket_pair_mux.cpp'),
+    include_directories: ut_includedirs,
+    dependencies: ut_dependencies,
+    link_with: ut_library,
+)
+test(
+    'socket_pair_mux',
+    ut_socket_pair_mux,
+    workdir: ut_workdir,
+    is_parallel: false,
+    timeout: 1800,
+)
+
+ut_dtls_srtp_transport = executable(
+    'ut_dtls_srtp_transport',
+    sources: files('unitTest/media/test_dtls_srtp_transport.cpp'),
+    include_directories: ut_includedirs,
+    dependencies: ut_dependencies,
+    link_with: ut_library,
+)
+test(
+    'dtls_srtp_transport',
+    ut_dtls_srtp_transport,
+    workdir: ut_workdir,
+    is_parallel: false,
+    timeout: 1800,
+)
+
+ut_web_call_signaling = executable(
+    'ut_web_call_signaling',
+    sources: files('unitTest/call/test_web_call_signaling.cpp'),
+    include_directories: ut_includedirs,
+    dependencies: ut_dependencies,
+    link_with: ut_library,
+)
+test(
+    'web_call_signaling',
+    ut_web_call_signaling,
+    workdir: ut_workdir,
+    is_parallel: false,
+    timeout: 1800,
+)
+
+ut_webrtc_sdp = executable(
+    'ut_webrtc_sdp',
+    sources: files('unitTest/sip/test_webrtc_sdp.cpp'),
+    include_directories: ut_includedirs,
+    dependencies: ut_dependencies,
+    link_with: ut_library,
+)
+test(
+    'webrtc_sdp',
+    ut_webrtc_sdp,
+    workdir: ut_workdir,
+    is_parallel: false,
+    timeout: 1800,
+)
+
 ut_sdes_negotiator = executable(
     'ut_sdes_negotiator',
     sources: files('unitTest/sip/sdes_negotiator.cpp'),
