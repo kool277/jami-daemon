@@ -101,6 +101,21 @@ test(
     timeout: 1800,
 )
 
+ut_socket_pair_mux = executable(
+    'ut_socket_pair_mux',
+    sources: files('unitTest/media/test_socket_pair_mux.cpp'),
+    include_directories: ut_includedirs,
+    dependencies: ut_dependencies,
+    link_with: ut_library,
+)
+test(
+    'socket_pair_mux',
+    ut_socket_pair_mux,
+    workdir: ut_workdir,
+    is_parallel: false,
+    timeout: 1800,
+)
+
 ut_sdes_negotiator = executable(
     'ut_sdes_negotiator',
     sources: files('unitTest/sip/sdes_negotiator.cpp'),

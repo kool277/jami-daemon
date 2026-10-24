@@ -1102,6 +1102,7 @@ else()
         add_test_executable(syncHistory test/unitTest/syncHistory/syncHistory.cpp)
         add_test_executable(base64 test/unitTest/base64/base64.cpp)
         add_test_executable(srtp test/unitTest/media/test_srtp.cpp)
+        add_test_executable(socket_pair_mux test/unitTest/media/test_socket_pair_mux.cpp)
         add_test_executable(linkdevice test/unitTest/linkdevice/linkdevice.cpp)
 
         if (JAMI_VIDEO)

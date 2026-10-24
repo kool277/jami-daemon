@@ -43,6 +43,9 @@ public:
     virtual ~RtpSession() {};
 
     virtual void start(std::unique_ptr<dhtnet::IceSocket> rtp_sock, std::unique_ptr<dhtnet::IceSocket> rtcp_sock) = 0;
+    // Starts on a transport the caller set up, encryption included, for
+    // example a WebRTC leg whose SRTP keys come from DTLS.
+    virtual void start(std::unique_ptr<SocketPair> socketPair) = 0;
     virtual void restartSender() = 0;
     virtual void stop() = 0;
     void setMediaSource(const std::string& resource) { input_ = resource; }
