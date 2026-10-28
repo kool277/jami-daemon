@@ -1106,6 +1106,7 @@ else()
         add_test_executable(dtls_srtp_transport test/unitTest/media/test_dtls_srtp_transport.cpp)
         add_test_executable(webrtc_sdp test/unitTest/sip/test_webrtc_sdp.cpp)
         add_test_executable(web_call_signaling test/unitTest/call/test_web_call_signaling.cpp)
+        add_test_executable(web_call_delivery test/unitTest/call/test_web_call_delivery.cpp)
         add_test_executable(webrtc_call test/unitTest/call/test_webrtc_call.cpp)
         add_test_executable(linkdevice test/unitTest/linkdevice/linkdevice.cpp)
 

@@ -31,6 +31,9 @@
 
 namespace jami {
 
+namespace test {
+class WebCallDeliveryTest;
+}
 class JamiAccount;
 class WebRtcCall;
 
@@ -130,6 +133,8 @@ private:
               const std::string& device = {});
     // To each member of the conversation, this account included, on each device.
     void broadcast(const std::string& conversationId, const std::string& type, Json::Value&& data);
+
+    friend class test::WebCallDeliveryTest;
 
     std::weak_ptr<JamiAccount> account_;
     const std::string accountId_;
