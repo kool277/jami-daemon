@@ -3860,6 +3860,19 @@ JamiAccount::forEachDevice(const dht::InfoHash& to,
     accountManager_->forEachDevice(to, std::move(op), std::move(end));
 }
 
+std::vector<DeviceId>
+JamiAccount::messageChannelDevices(const std::string& uri) const
+{
+    std::vector<DeviceId> devices;
+    std::shared_lock lk(connManagerMtx_);
+    auto it = channelHandlers_.find(Uri::Scheme::MESSAGE);
+    if (it == channelHandlers_.end() or not it->second)
+        return devices;
+    for (const auto& channel : static_cast<MessageChannelHandler*>(it->second.get())->getChannels(uri))
+        devices.emplace_back(channel->deviceId());
+    return devices;
+}
+
 uint64_t
 JamiAccount::sendTextMessage(const std::string& to,
                              const std::string& deviceId,

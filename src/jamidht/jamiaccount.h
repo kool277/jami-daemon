@@ -371,6 +371,12 @@ public:
                        std::function<void(const std::shared_ptr<dht::crypto::PublicKey>&)>&& op,
                        std::function<void(bool)>&& end = {});
 
+    /**
+     * The devices of the account at uri that this account has a message
+     * channel with: a message reaches them without the DHT.
+     */
+    std::vector<DeviceId> messageChannelDevices(const std::string& uri) const;
+
     bool setPushNotificationToken(const std::string& pushDeviceToken = "") override;
     bool setPushNotificationTopic(const std::string& topic) override;
     bool setPushNotificationConfig(const std::map<std::string, std::string>& data) override;

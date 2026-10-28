@@ -32,11 +32,27 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <mutex>
 #include <optional>
+#include <set>
 
 namespace jami {
 
 namespace {
+
+// The devices that a message to an account went to, added from callbacks on
+// several threads: each device gets the message once.
+struct Recipients
+{
+    std::mutex mutex;
+    std::set<std::string> devices;
+
+    bool add(const std::string& device)
+    {
+        std::lock_guard lk(mutex);
+        return devices.emplace(device).second;
+    }
+};
 
 // A description is at most 64 KiB (webrtc::parse refuses more).
 constexpr size_t MAX_MESSAGE_SIZE = 80 * 1024;
@@ -1234,15 +1250,23 @@ WebCallSignaling::send(const std::string& to,
         // to an account sent once one device has it, so a device that connects
         // later, such as the web client's server, would not get it. Every
         // browser of the account rings, stops, or hears of the member.
-        account->forEachDevice(dht::InfoHash(to),
-                               [w = account_, to, payloads, self = account->currentDeviceId()](
-                                   const std::shared_ptr<dht::crypto::PublicKey>& dev) {
-                                   auto deviceId = dev->getLongId().toString();
-                                   if (deviceId == self)
-                                       return;
-                                   if (auto account = w.lock())
-                                       account->sendTextMessage(to, deviceId, payloads);
-                               });
+        // The devices this one has a message channel with get it at once.
+        // Finding the others takes the DHT, which finds none while it is
+        // unreachable: an answer lost that way fails the call although the
+        // browser's server is connected.
+        auto recipients = std::make_shared<Recipients>();
+        auto sendTo = [w = account_, to, payloads, recipients, self = std::string(account->currentDeviceId())](
+                          const std::string& deviceId) {
+            if (deviceId == self or not recipients->add(deviceId))
+                return;
+            if (auto account = w.lock())
+                account->sendTextMessage(to, deviceId, payloads);
+        };
+        for (const auto& device : account->messageChannelDevices(to))
+            sendTo(device.toString());
+        account->forEachDevice(dht::InfoHash(to), [sendTo](const std::shared_ptr<dht::crypto::PublicKey>& dev) {
+            sendTo(dev->getLongId().toString());
+        });
         return;
     }
     // A description is for the peer's session, on the device it came from.
